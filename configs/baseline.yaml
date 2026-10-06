@@ -32,6 +32,6 @@ train:
   batch_size: 64
   lr: 1.0e-3
   weight_decay: 1.0e-2
-  num_workers: 6
+  num_workers: 10
   seed: 42
   amp: true

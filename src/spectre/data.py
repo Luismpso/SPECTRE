@@ -88,15 +88,34 @@ def build_manifest(subset_dir: Path, out_csv: Path, seed: int = 42) -> pd.DataFr
 
 
 # --------------------------------------------------------------------------- dataset
-def load_audio(path: str, sample_rate: int) -> np.ndarray:
-    wav, sr = sf.read(path, dtype="float32", always_2d=False)
+def _to_mono_resampled(wav: np.ndarray, sr: int, sample_rate: int) -> np.ndarray:
     if wav.ndim > 1:
         wav = wav.mean(axis=1)
     if sr != sample_rate:
         import torchaudio.functional as AF
 
-        wav = AF.resample(torch.from_numpy(wav), sr, sample_rate).numpy()
-    return wav
+        wav = AF.resample(torch.from_numpy(np.ascontiguousarray(wav)), sr, sample_rate).numpy()
+    return wav.astype(np.float32, copy=False)
+
+
+def load_audio(path: str, sample_rate: int) -> np.ndarray:
+    wav, sr = sf.read(path, dtype="float32", always_2d=False)
+    return _to_mono_resampled(wav, sr, sample_rate)
+
+
+def load_segment(path: str, sample_rate: int, n: int, where: str = "random") -> np.ndarray:
+    """Read only an n-sample segment from disk (random or centred) instead of the whole file.
+    Falls back to a full read when the file needs resampling or is shorter than n."""
+    with sf.SoundFile(path) as f:
+        total, sr = f.frames, f.samplerate
+        if sr != sample_rate or total <= n:
+            wav = f.read(dtype="float32", always_2d=False)
+            return fix_length(_to_mono_resampled(wav, sr, sample_rate), n,
+                              start=None if where == "random" else max(0, (len(wav) - n) // 2))
+        start = np.random.randint(0, total - n + 1) if where == "random" else (total - n) // 2
+        f.seek(start)
+        wav = f.read(n, dtype="float32", always_2d=False)
+    return _to_mono_resampled(wav, sr, sample_rate)
 
 
 def fix_length(wav: np.ndarray, n: int, start: int | None = None) -> np.ndarray:
@@ -135,13 +154,13 @@ class SpeakerDataset(Dataset):
 
     def __getitem__(self, i: int):
         row = self.df.iloc[i]
-        wav = load_audio(row["path"], self.sr)
         label = self.label_map[row["speaker"]]
         if self.mode == "train":
-            wav = self._augment(fix_length(wav, self.n))
+            wav = self._augment(load_segment(row["path"], self.sr, self.n, "random"))
         elif self.mode == "val":
-            start = max(0, (len(wav) - self.n) // 2)
-            wav = fix_length(wav, self.n, start=start)
+            wav = load_segment(row["path"], self.sr, self.n, "centre")
+        else:  # test: full utterance, windowed in evaluate.py
+            wav = load_audio(row["path"], self.sr)
         return torch.from_numpy(np.ascontiguousarray(wav)), label
 
 

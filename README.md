@@ -18,7 +18,7 @@ The approach borrows from the BirdCLEF Kaggle competitions: audio is turned into
 
 - **Session-aware splits.** LibriSpeech chapters are separate recording sessions. Test chapters are never seen during training, so the model has to recognise the *voice*, not the microphone or the room (see `src/spectre/data.py`).
 - **No pitch-shift augmentation** — it changes speaker identity. Augmentation is additive noise, random gain and SpecAugment (frequency/time masking).
-- **GPU front-end.** Mel features are computed inside the model, so the data loader only moves raw waveforms.
+- **Fast data loading.** Only the 3 s training/validation crop is read from disk (≈15× faster than decoding the whole FLAC), and mel features are computed on the GPU inside the model.
 - **Full-utterance test evaluation.** A 3 s window slides over each test utterance and the softmax probabilities are averaged.
 
 ## Setup
@@ -44,11 +44,14 @@ python -m spectre.data --subset train-clean-100
 # 3. Train (evaluates the best checkpoint on the test split at the end)
 python -m spectre.train --config configs/baseline.yaml
 
+# Interrupted (Ctrl+C, crash, laptop asleep)? Continue from the last completed epoch
+python -m spectre.train --resume runs/<run>/last.pt
+
 # Evaluate any checkpoint again
 python -m spectre.evaluate --ckpt runs/<run>/best.pt --split test
 ```
 
-Each run writes `config.yaml`, `history.csv`, `best.pt` and `results.json` to `runs/<run_name>_<timestamp>/`.
+Each run writes `config.yaml`, `history.csv`, `best.pt` (best validation weights), `last.pt` (full training state for resuming) and `results.json` to `runs/<run_name>_<timestamp>/`.
 
 ## Structure
 
