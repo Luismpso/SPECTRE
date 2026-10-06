@@ -1,0 +1,35 @@
+# --- Data & artefacts (never commit audio or checkpoints) ---
+data/
+runs/
+*.wav
+*.flac
+*.mp3
+*.ogg
+*.m4a
+*.tar.gz
+*.zip
+*.pt
+*.pth
+*.ckpt
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# --- Environments ---
+.venv/
+venv/
+env/
+.env
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,37 @@
+# Phase 1 baseline: log-mel spectrograms -> ImageNet-pretrained CNN -> closed-set speaker classification
+run_name: baseline_effb0
+
+data:
+  manifest: data/manifests/train-clean-100.csv
+  sample_rate: 16000
+  crop_seconds: 3.0          # random crop length during training
+  eval_hop_seconds: 1.5      # sliding-window hop for full-utterance test evaluation
+
+features:
+  n_fft: 512                 # 32 ms window at 16 kHz
+  hop_length: 160            # 10 ms hop
+  n_mels: 80
+  f_min: 20
+  f_max: 7600
+
+augment:
+  noise_prob: 0.5            # additive Gaussian noise at a random SNR
+  snr_db: [10, 30]
+  gain_db: [-6, 6]
+  freq_mask: 10              # SpecAugment (no pitch shift: it would change speaker identity)
+  time_mask: 40
+  n_masks: 2
+
+model:
+  backbone: efficientnet_b0  # any timm model name, e.g. resnet34, efficientnet_b2
+  pretrained: true
+  dropout: 0.2
+
+train:
+  epochs: 30
+  batch_size: 64
+  lr: 1.0e-3
+  weight_decay: 1.0e-2
+  num_workers: 6
+  seed: 42
+  amp: true

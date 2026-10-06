@@ -1,0 +1,11 @@
+# Install PyTorch first, matching your GPU (RTX 50xx / Blackwell needs CUDA 12.8 builds):
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+torch>=2.7
+torchaudio>=2.7
+torchvision>=0.22
+timm>=1.0
+soundfile>=0.12
+numpy
+pandas
+pyyaml
+tqdm
