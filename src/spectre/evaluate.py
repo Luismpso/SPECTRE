@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from .data import SpeakerDataset
-from .model import SpectreNet
+from .model import build_model
 
 
 def sliding_windows(wav: torch.Tensor, win: int, hop: int) -> torch.Tensor:
@@ -53,7 +53,7 @@ def main() -> None:
     cfg, label_map = ck["cfg"], ck["label_map"]
     cfg["model"]["pretrained"] = False
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = SpectreNet(cfg, len(label_map)).to(device)
+    model = build_model(cfg, len(label_map)).to(device)
     model.load_state_dict(ck["model"])
 
     df = pd.read_csv(cfg["data"]["manifest"], dtype={"speaker": str, "chapter": str})

@@ -26,7 +26,7 @@ from tqdm import tqdm
 
 from .data import SpeakerDataset
 from .evaluate import evaluate_utterances
-from .model import SpectreNet
+from .model import build_model
 
 
 def seed_everything(seed: int) -> None:
@@ -131,13 +131,16 @@ def main() -> None:
     val_dl = DataLoader(SpeakerDataset(splits["val"], label_map, cfg, "val"),
                         batch_size=tc["batch_size"], shuffle=False, **loader_kw)
 
-    model = SpectreNet(cfg, len(label_map)).to(device)
+    model = build_model(cfg, len(label_map)).to(device)
+    uses_margin = getattr(model, "uses_margin", False)
     opt = torch.optim.AdamW(model.parameters(), lr=tc["lr"], weight_decay=tc["weight_decay"])
     max_steps = tc.get("max_steps")
     steps_per_epoch = min(len(train_dl), max_steps or len(train_dl))
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=tc["lr"], pct_start=0.1,
                                                 total_steps=tc["epochs"] * steps_per_epoch)
-    crit = nn.CrossEntropyLoss(label_smoothing=0.1)
+    crit = nn.CrossEntropyLoss(label_smoothing=tc.get("label_smoothing", 0.0 if uses_margin else 0.1))
+    margin_max = cfg["model"].get("margin", 0.2)
+    margin_warmup = cfg["model"].get("margin_warmup_epochs", 0)
 
     if ckpt:
         model.load_state_dict(ckpt["model"])
@@ -155,6 +158,8 @@ def main() -> None:
     try:
         for epoch in range(start_epoch, tc["epochs"] + 1):
             model.train()
+            if uses_margin:  # AAM margin warm-up: start easy, reach the full margin after `margin_warmup` epochs
+                model.head.margin = margin_max * min(1.0, epoch / margin_warmup) if margin_warmup else margin_max
             t0, run_loss, run_correct, seen = time.time(), 0.0, 0, 0
             bar = tqdm(train_dl, total=steps_per_epoch, desc=f"epoch {epoch}/{tc['epochs']}", leave=False)
             for step, (wav, y) in enumerate(bar):
@@ -162,7 +167,7 @@ def main() -> None:
                     break
                 wav, y = wav.to(device, non_blocking=True), y.to(device, non_blocking=True)
                 with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp):
-                    logits = model(wav)
+                    logits = model(wav, y)
                     loss = crit(logits.float(), y)
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
@@ -170,7 +175,8 @@ def main() -> None:
                 opt.step()
                 sched.step()
                 run_loss += loss.item() * y.numel()
-                run_correct += (logits.argmax(1) == y).sum().item()
+                scores = model.head.last_cosine if uses_margin else logits
+                run_correct += (scores.argmax(1) == y).sum().item()
                 seen += y.numel()
                 bar.set_postfix(loss=f"{run_loss / seen:.3f}", acc=f"{run_correct / seen:.3f}")
 
@@ -189,8 +195,9 @@ def main() -> None:
                         "scheduler": sched.state_dict(), "rng": rng_state(), "epoch": epoch,
                         "history": history, "best_acc": best_acc, "cfg": cfg, "label_map": label_map},
                        run_dir / "last.pt")
+            m_txt = f" · margin {model.head.margin:.2f}" if uses_margin else ""
             print(f"epoch {epoch:3d} · train loss {rec['train_loss']:.3f} acc {rec['train_acc']:.3f} · "
-                  f"val loss {val_loss:.3f} acc {val_acc:.3f} · {rec['secs']}s{flag}")
+                  f"val loss {val_loss:.3f} acc {val_acc:.3f} · {rec['secs']}s{m_txt}{flag}")
     except KeyboardInterrupt:
         done = history[-1]["epoch"] if history else 0
         print(f"\n⏸ Interrupted. Last completed epoch: {done}. Continue with:\n"
@@ -200,6 +207,8 @@ def main() -> None:
     # final test on full utterances with the best checkpoint (new recording sessions)
     best = torch.load(run_dir / "best.pt", map_location=device, weights_only=False)
     model.load_state_dict(best["model"])
+    if uses_margin:
+        model.head.margin = margin_max
     test = evaluate_utterances(model, splits["test"], label_map, cfg, device)
     test["best_val_acc"], test["best_epoch"] = best_acc, best["epoch"]
     (run_dir / "results.json").write_text(json.dumps(test, indent=2))

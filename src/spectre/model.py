@@ -10,6 +10,8 @@ import torch
 import torch.nn as nn
 import torchaudio.transforms as T
 
+from .ecapa import AAMSoftmax, ECAPATDNN
+
 
 class LogMelFrontend(nn.Module):
     def __init__(self, sample_rate: int, feat: dict, aug: dict | None = None):
@@ -57,11 +59,42 @@ class SpectreNet(nn.Module):
             drop_rate=m.get("dropout", 0.0),
         )
 
-    def forward(self, wav: torch.Tensor) -> torch.Tensor:
+    def forward(self, wav: torch.Tensor, labels: torch.Tensor | None = None) -> torch.Tensor:
         return self.backbone(self.frontend(wav))
 
     @torch.no_grad()
     def embed(self, wav: torch.Tensor) -> torch.Tensor:
-        """Pooled penultimate features — a first, untrained-for-it speaker embedding (phase 2 replaces this)."""
+        """Pooled penultimate features (not trained as an embedding — use EmbeddingNet for that)."""
         feats = self.backbone.forward_features(self.frontend(wav))
         return self.backbone.forward_head(feats, pre_logits=True)
+
+
+class EmbeddingNet(nn.Module):
+    """Phase 2: log-mel -> ECAPA-TDNN -> 192-d speaker embedding, trained with an AAM-softmax head.
+
+    The head is only needed for training; at inference speakers are compared by the cosine
+    similarity of their embeddings, so new people can be enrolled without retraining."""
+
+    uses_margin = True
+
+    def __init__(self, cfg: dict, num_classes: int):
+        super().__init__()
+        m = cfg["model"]
+        self.frontend = LogMelFrontend(cfg["data"]["sample_rate"], cfg["features"], cfg.get("augment"))
+        self.encoder = ECAPATDNN(cfg["features"]["n_mels"], m.get("channels", 512), m.get("emb_dim", 192))
+        self.head = AAMSoftmax(m.get("emb_dim", 192), num_classes, m.get("margin", 0.2), m.get("scale", 30.0))
+
+    def embed(self, wav: torch.Tensor) -> torch.Tensor:
+        return self.encoder(self.frontend(wav).squeeze(1))
+
+    def forward(self, wav: torch.Tensor, labels: torch.Tensor | None = None) -> torch.Tensor:
+        return self.head(self.embed(wav), labels)
+
+
+def build_model(cfg: dict, num_classes: int) -> nn.Module:
+    kind = cfg["model"].get("type", "cnn")
+    if kind == "ecapa":
+        return EmbeddingNet(cfg, num_classes)
+    if kind == "cnn":
+        return SpectreNet(cfg, num_classes)
+    raise ValueError(f"unknown model.type: {kind}")
