@@ -2,7 +2,7 @@
 
 **SPE**ctral **C**lassifier for **T**alker **RE**cognition — identifying who is speaking from the frequency spectrum of their voice.
 
-> Status: **Phase 2 complete** — next: a live microphone demo (phase 3)
+> Status: **Phase 3 — live demo** · phases 1 and 2 complete
 
 ## Idea
 
@@ -12,7 +12,7 @@ The approach borrows from the BirdCLEF Kaggle competitions: audio is turned into
 |---|---|---|
 | **1 · Baseline** ✅ | Closed-set classification of a fixed set of speakers | Log-mel → EfficientNet (timm) → softmax |
 | **2 · Embeddings** ✅ | Open-set identification: enroll a new person with a few seconds of speech, no retraining | ECAPA-TDNN + AAM-softmax, cosine scoring, EER |
-| **3 · Demo** | Live microphone identification with an "unknown speaker" threshold | Enrollment + real-time inference |
+| **3 · Demo** ✅ | Live microphone identification with an "unknown speaker" threshold | Enrollment + real-time inference |
 
 ## Design choices
 
@@ -76,6 +76,22 @@ The classifier head is thrown away after training: speakers are compared by the 
 
 The AAM margin is warmed up over the first epochs (0.04 → 0.2) so training does not collapse early.
 
+## Phase 3 — live demo
+
+```bash
+pip install sounddevice                      # microphone access (Linux: sudo apt install libportaudio2)
+python -m spectre.live enroll "Ana"          # speak for 20 s
+python -m spectre.live enroll "Rui"
+python -m spectre.live calibrate             # threshold from the enrolled voices
+python -m spectre.live identify              # who is speaking right now? (Ctrl+C to stop)
+```
+
+- Uses the most recent phase-2 model (`--ckpt` to pick another) and runs in real time on GPU or CPU.
+- Every 0.5 s, the current turn — the speech since the last pause, up to 3 s — is embedded and compared with each enrolled person; below the threshold the voice is reported as **unknown**. Scores are smoothed within a turn and reset at pauses, so a new speaker is picked up within about a second.
+- `enroll` and `identify` also accept `--file`, which runs recordings through exactly the same pipeline (handy for testing without a microphone). `devices`, `list`, `remove` and `--device` manage microphones and people.
+- **Privacy:** only voice embeddings are stored (`enrollments/speakers.json`), never audio. They are biometric data, so `enrollments/` is git-ignored.
+- Expect lower scores than on LibriSpeech: the model was trained on English audiobooks, while a live demo has another microphone, room and language. Enrolling with the same microphone used for identification helps. With two or more people enrolled, `calibrate` sets the threshold from how similar the enrolled voices are to each other (otherwise the model's own EER threshold is used).
+
 ## Structure
 
 ```
@@ -90,6 +106,8 @@ src/spectre/
   train.py      training loop (AdamW, OneCycle, bf16 AMP, resumable)
   evaluate.py   sliding-window full-utterance classification (top-1 / top-5)
   embed_eval.py EER / minDCF, enroll-and-identify, closed-set by embedding
+  live.py       live demo: enrollment, voice activity detection, real-time identification
+tests/test_live.py   fast tests for the demo (no data, GPU or microphone needed): pytest -q
 ```
 
 ## Results

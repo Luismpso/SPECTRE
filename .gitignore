@@ -1,6 +1,8 @@
 # --- Data & artefacts (never commit audio or checkpoints) ---
 data/
 runs/
+# voice embeddings of enrolled people are biometric data: keep them private
+enrollments/
 *.wav
 *.flac
 *.mp3

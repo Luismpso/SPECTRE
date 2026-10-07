@@ -8,5 +8,8 @@ version = "0.1.0"
 description = "SPEctral Classifier for Talker REcognition — speaker identification from voice spectra"
 requires-python = ">=3.10"
 
+[project.optional-dependencies]
+demo = ["sounddevice>=0.4.6"]   # microphone access for the live demo
+
 [tool.setuptools.packages.find]
 where = ["src"]
