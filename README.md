@@ -2,7 +2,7 @@
 
 **SPE**ctral **C**lassifier for **T**alker **RE**cognition — identifying who is speaking from the frequency spectrum of their voice.
 
-> Status: **Phase 2 complete** — next: training on more speakers, then a live microphone demo (phase 3)
+> Status: **Phase 2 complete** — next: a live microphone demo (phase 3)
 
 ## Idea
 
@@ -72,7 +72,7 @@ The classifier head is thrown away after training: speakers are compared by the 
 
 - **Verification EER / minDCF** on 80 speakers that were **never seen in training** (LibriSpeech dev-clean + test-clean). Every same-speaker pair from *different* chapters is scored against every different-speaker pair.
 - **Enroll-and-identify on unseen speakers** (the 60 of them with ≥ 2 sessions): each new person is enrolled with ~10 s of speech from one session and identified from their other sessions — the "add someone without retraining" scenario.
-- **Closed-set identification** of the 251 training speakers by nearest enrolled embedding, directly comparable with phase 1.
+- **Closed-set identification** of the training speakers by nearest enrolled embedding, directly comparable with the classifier head.
 
 The AAM margin is warmed up over the first epochs (0.04 → 0.2) so training does not collapse early.
 
@@ -104,12 +104,13 @@ Phase 2 — ECAPA-TDNN speaker embeddings (C = 512, 6.2 M parameters, trained fr
 
 | Training data | Train speakers | Known speakers · top-1 | Unseen speakers · EER ↓ | Unseen · minDCF (p = 0.01) ↓ | Unseen · enroll 10 s → top-1 |
 |---|---|---|---|---|---|
-| train-clean-100 | 251 | **94.3 %** | **6.75 %** | 0.432 | **87.4 %** |
-| train-clean-100 + 360 | 1,172 | — | — | — | — |
+| train-clean-100 | 251 | 94.3 % | 6.75 % | 0.432 | 87.4 % |
+| train-clean-100 + 360 | 1,172 | 90.2 % | **6.23 %** | **0.308** | **91.9 %** |
 
-- **Known speakers**: full test utterances from recording sessions never seen in training (top-5: 97.4 %). Identifying them by the nearest enrolled embedding instead of the classifier head gives 94.1 %, so the 192-d embedding alone carries the identity. Compared with phase 1, the closed-set error drops from 15.7 % to 5.7 %. This number depends on how many speakers are known, so it is not comparable across rows.
-- **Unseen speakers**: the 80 LibriSpeech dev-clean + test-clean speakers, never heard in training; enroll-and-identify uses the 60 with ≥ 2 sessions (top-5: 94.3 %). Every row is evaluated on these same speakers, so these columns are directly comparable across training sets.
-- The cosine threshold at the EER operating point is **0.33**, the starting value for the demo's "unknown speaker" decision.
+- **More training speakers generalise better to new people.** With 4.7× more speakers, enroll-and-identify errors on unseen speakers fall from 12.6 % to 8.1 % (−36 %), minDCF by 29 % and EER from 6.75 % to 6.23 %.
+- **Known speakers**: full test utterances from recording sessions never seen in training (top-5: 97.4 % with 251 speakers, 94.6 % with 1,172). Identifying them by the nearest enrolled embedding instead of the classifier head gives practically the same accuracy (94.1 % and 90.2 %), so the 192-d embedding alone carries the identity. Compared with phase 1, the 251-speaker closed-set error drops from 15.7 % to 5.7 %. This number depends on how many speakers are known, so it is not comparable across rows.
+- **Unseen speakers**: the 80 LibriSpeech dev-clean + test-clean speakers, never heard in training; enroll-and-identify uses the 60 with ≥ 2 sessions (top-5: 94.3 % → 95.2 %). Every row is evaluated on these same speakers, so these columns are directly comparable across training sets.
+- The 1,172-speaker model trains in under 10 minutes on an RTX 5070 Ti (20 epochs × 25 s). Its cosine threshold at the EER operating point is **0.27**, the starting value for the demo's "unknown speaker" decision.
 
 ## License
 
