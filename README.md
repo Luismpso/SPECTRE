@@ -2,7 +2,7 @@
 
 **SPE**ctral **C**lassifier for **T**alker **RE**cognition — identifying who is speaking from the frequency spectrum of their voice.
 
-> Status: **Phase 2 — speaker embeddings (ECAPA-TDNN + AAM-softmax)**
+> Status: **Phase 2 complete** — next: training on more speakers, then a live microphone demo (phase 3)
 
 ## Idea
 
@@ -11,15 +11,15 @@ The approach borrows from the BirdCLEF Kaggle competitions: audio is turned into
 | Phase | Goal | Method |
 |---|---|---|
 | **1 · Baseline** ✅ | Closed-set classification of a fixed set of speakers | Log-mel → EfficientNet (timm) → softmax |
-| **2 · Embeddings** 🔧 | Open-set identification: enroll a new person with a few seconds of speech, no retraining | ECAPA-TDNN + AAM-softmax, cosine scoring, EER |
+| **2 · Embeddings** ✅ | Open-set identification: enroll a new person with a few seconds of speech, no retraining | ECAPA-TDNN + AAM-softmax, cosine scoring, EER |
 | **3 · Demo** | Live microphone identification with an "unknown speaker" threshold | Enrollment + real-time inference |
 
 ## Design choices
 
 - **Session-aware splits.** LibriSpeech chapters are separate recording sessions. Test chapters are never seen during training, so the model has to recognise the *voice*, not the microphone or the room (see `src/spectre/data.py`).
 - **No pitch-shift augmentation** — it changes speaker identity. Augmentation is additive noise, random gain and SpecAugment (frequency/time masking).
-- **Fast data loading.** Only the 3 s training/validation crop is read from disk (≈15× faster than decoding the whole FLAC), and mel features are computed on the GPU inside the model.
-- **Full-utterance test evaluation.** A 3 s window slides over each test utterance and the softmax probabilities are averaged.
+- **Fast data loading.** Only the training/validation crop (2–3 s) is read from disk (≈15× faster than decoding the whole FLAC), and mel features are computed on the GPU inside the model.
+- **Full-utterance test evaluation.** A crop-length window (3 s for the CNN, 2 s for ECAPA) slides over each test utterance and the softmax probabilities are averaged.
 
 ## Setup
 
@@ -51,6 +51,12 @@ python -m spectre.data --subset dev-clean && python -m spectre.data --subset tes
 python -m spectre.train --config configs/ecapa.yaml
 python -m spectre.embed_eval --ckpt runs/<run>/best.pt            # EER + enroll-and-identify
 
+# 3c. Phase 2b — same model, 1,172 training speakers (~30 GB of audio; desktop GPU recommended)
+python scripts/download_librispeech.py --subset train-clean-360
+python -m spectre.data --subset train-clean-100 train-clean-360    # merged manifest
+python -m spectre.train --config configs/ecapa_460.yaml
+python -m spectre.embed_eval --ckpt runs/<run>/best.pt
+
 # Interrupted (Ctrl+C, crash, laptop asleep)? Continue from the last completed epoch
 python -m spectre.train --resume runs/<run>/last.pt
 
@@ -65,7 +71,7 @@ Each run writes `config.yaml`, `history.csv`, `best.pt` (best validation weights
 The classifier head is thrown away after training: speakers are compared by the **cosine similarity of 192-d embeddings**. `spectre.embed_eval` reports three things:
 
 - **Verification EER / minDCF** on 80 speakers that were **never seen in training** (LibriSpeech dev-clean + test-clean). Every same-speaker pair from *different* chapters is scored against every different-speaker pair.
-- **Enroll-and-identify on unseen speakers**: each new person is enrolled with ~10 s of speech from one session and identified from their other sessions — the "add someone without retraining" scenario.
+- **Enroll-and-identify on unseen speakers** (the 60 of them with ≥ 2 sessions): each new person is enrolled with ~10 s of speech from one session and identified from their other sessions — the "add someone without retraining" scenario.
 - **Closed-set identification** of the 251 training speakers by nearest enrolled embedding, directly comparable with phase 1.
 
 The AAM margin is warmed up over the first epochs (0.04 → 0.2) so training does not collapse early.
@@ -75,6 +81,7 @@ The AAM margin is warmed up over the first epochs (0.04 → 0.2) so training doe
 ```
 configs/baseline.yaml          phase 1 hyper-parameters
 configs/ecapa.yaml             phase 2 hyper-parameters
+configs/ecapa_460.yaml         phase 2b: same model, 1,172 training speakers
 scripts/download_librispeech.py
 src/spectre/
   data.py       manifest, session-aware split, waveform dataset + augmentation
@@ -93,11 +100,16 @@ Phase 1 — closed-set classification (251 known speakers, test = unseen recordi
 |---|---|---|---|
 | train-clean-100 | EfficientNet-B0 (ImageNet init) | 84.3 % | 91.1 % |
 
-Phase 2 — speaker embeddings:
+Phase 2 — ECAPA-TDNN speaker embeddings (C = 512, 6.2 M parameters, trained from scratch with AAM-softmax):
 
-| Data | Model | Unseen EER ↓ | Unseen enroll 10 s → top-1 | Known top-1 (by embedding) |
-|---|---|---|---|---|
-| train-clean-100 | ECAPA-TDNN (C=512) | — | — | — |
+| Training data | Train speakers | Known speakers · top-1 | Unseen speakers · EER ↓ | Unseen · minDCF (p = 0.01) ↓ | Unseen · enroll 10 s → top-1 |
+|---|---|---|---|---|---|
+| train-clean-100 | 251 | **94.3 %** | **6.75 %** | 0.432 | **87.4 %** |
+| train-clean-100 + 360 | 1,172 | — | — | — | — |
+
+- **Known speakers**: full test utterances from recording sessions never seen in training (top-5: 97.4 %). Identifying them by the nearest enrolled embedding instead of the classifier head gives 94.1 %, so the 192-d embedding alone carries the identity. Compared with phase 1, the closed-set error drops from 15.7 % to 5.7 %. This number depends on how many speakers are known, so it is not comparable across rows.
+- **Unseen speakers**: the 80 LibriSpeech dev-clean + test-clean speakers, never heard in training; enroll-and-identify uses the 60 with ≥ 2 sessions (top-5: 94.3 %). Every row is evaluated on these same speakers, so these columns are directly comparable across training sets.
+- The cosine threshold at the EER operating point is **0.33**, the starting value for the demo's "unknown speaker" decision.
 
 ## License
 

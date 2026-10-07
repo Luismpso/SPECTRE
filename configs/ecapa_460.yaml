@@ -1,0 +1,52 @@
+# Phase 2b: the same ECAPA-TDNN, trained on 4.7x more speakers (1,172 vs 251).
+# Unseen-speaker EER is limited mainly by the number of training speakers, so this is
+# the main lever before moving to real microphones. Needs ~30 GB of audio (desktop).
+run_name: ecapa_c512_460h
+
+data:
+  manifest: data/manifests/train-clean-100+train-clean-360.csv
+  sample_rate: 16000
+  crop_seconds: 2.0          # short crops are standard for embedding training
+  eval_hop_seconds: 1.0
+
+features:
+  n_fft: 512
+  hop_length: 160
+  n_mels: 80
+  f_min: 20
+  f_max: 7600
+
+augment:
+  noise_prob: 0.5
+  snr_db: [5, 25]
+  gain_db: [-6, 6]
+  freq_mask: 8
+  time_mask: 20
+  n_masks: 2
+
+model:
+  type: ecapa
+  channels: 512              # 1024 is the "large" ECAPA; 512 trains comfortably on a laptop GPU
+  emb_dim: 192
+  margin: 0.2                # AAM margin (radians)
+  scale: 30.0
+  margin_warmup_epochs: 3    # margin ramps 0.07 -> 0.2 over the first 3 epochs
+
+train:
+  epochs: 20                 # each epoch has ~4.7x more data than with train-clean-100 alone
+  batch_size: 128
+  lr: 2.0e-3
+  weight_decay: 2.0e-5
+  label_smoothing: 0.0
+  num_workers: 10            # desktop (12 threads); use 6 on an 8-thread laptop
+  seed: 42
+  amp: true
+
+# Embedding evaluation (python -m spectre.embed_eval)
+eval:
+  unseen_manifests:          # speakers NEVER seen in training -> verification EER + enroll-and-identify
+    - data/manifests/dev-clean.csv
+    - data/manifests/test-clean.csv
+  enroll_seconds: 10         # speech used to enroll each new speaker
+  max_utt_seconds: 20        # cap per-utterance length when extracting embeddings
+  enroll_per_speaker: 20     # train utterances used to enroll each known speaker (closed-set test)

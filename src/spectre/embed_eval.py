@@ -69,7 +69,9 @@ def verification(emb: torch.Tensor, df: pd.DataFrame) -> dict:
     same_spk = spk[iu[0]] == spk[iu[1]]
     same_chap = chap[iu[0]] == chap[iu[1]]
     s = sim[iu]
-    return eer_and_mindcf(s[same_spk & ~same_chap], s[~same_spk])
+    res = eer_and_mindcf(s[same_spk & ~same_chap], s[~same_spk])
+    res["n_speakers"] = int(df["speaker"].nunique())
+    return res
 
 
 def enroll_and_identify(emb: torch.Tensor, df: pd.DataFrame, enroll_seconds: float, seed: int = 0) -> dict:
@@ -102,7 +104,8 @@ def closed_set(model, df: pd.DataFrame, cfg: dict, device, per_speaker: int, see
     e_tr = extract(model, tr["path"].tolist(), cfg, device, "enroll known")
     e_te = extract(model, te["path"].tolist(), cfg, device, "test known")
     names = sorted(tr["speaker"].unique())
-    C = F.normalize(torch.stack([e_tr[(tr["speaker"] == s).to_numpy()].mean(0) for s in names]), dim=-1)
+    spk = tr["speaker"].to_numpy()
+    C = F.normalize(torch.stack([e_tr[torch.from_numpy(spk == s)].mean(0) for s in names]), dim=-1)
     scores = e_te @ C.T
     truth = torch.tensor([names.index(s) for s in te["speaker"]])
     return {"top1": float((scores.argmax(1) == truth).float().mean()),
@@ -148,12 +151,14 @@ def main() -> None:
     print()
     if "unseen_verification" in results:
         v, e = results["unseen_verification"], results["unseen_enroll_identify"]
-        print(f"UNSEEN speakers ({e['n_speakers']}) · verification EER {100 * v['eer']:.2f} % · "
+        print(f"UNSEEN · verification on {v['n_speakers']} speakers · EER {100 * v['eer']:.2f} % · "
               f"minDCF(0.01) {v['min_dcf']:.3f} · threshold {v['eer_threshold']:.3f}")
-        print(f"UNSEEN enroll {ev.get('enroll_seconds', 10)} s → identify · top-1 {e['top1']:.3f} · top-5 {e['top5']:.3f}")
+        print(f"UNSEEN · enroll {ev.get('enroll_seconds', 10)} s → identify among {e['n_speakers']} speakers "
+              f"(≥ 2 sessions) · top-1 {e['top1']:.3f} · top-5 {e['top5']:.3f}")
     if "known_closed_set" in results:
         k = results["known_closed_set"]
-        print(f"KNOWN speakers ({k['n_speakers']}) by embedding · top-1 {k['top1']:.3f} · top-5 {k['top5']:.3f}")
+        print(f"KNOWN · identify by embedding among {k['n_speakers']} speakers · "
+              f"top-1 {k['top1']:.3f} · top-5 {k['top5']:.3f}")
     print(f"Saved to {out}")
 
 

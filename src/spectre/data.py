@@ -71,8 +71,10 @@ def assign_splits(df: pd.DataFrame, seed: int = 42, val_frac: float = 0.10) -> p
     return df
 
 
-def build_manifest(subset_dir: Path, out_csv: Path, seed: int = 42) -> pd.DataFrame:
-    df = assign_splits(scan_librispeech(subset_dir), seed=seed)
+def build_manifest(subset_dirs: Path | list[Path], out_csv: Path, seed: int = 42) -> pd.DataFrame:
+    """Scan one or more LibriSpeech subsets (their speakers are disjoint) into one split manifest."""
+    dirs = [subset_dirs] if isinstance(subset_dirs, Path) else list(subset_dirs)
+    df = assign_splits(pd.concat([scan_librispeech(d) for d in dirs], ignore_index=True), seed=seed)
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out_csv, index=False)
 
@@ -165,10 +167,12 @@ class SpeakerDataset(Dataset):
 
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="Build a split manifest for a LibriSpeech subset")
-    p.add_argument("--subset", default="dev-clean")
+    p = argparse.ArgumentParser(description="Build a split manifest for one or more LibriSpeech subsets")
+    p.add_argument("--subset", nargs="+", default=["dev-clean"],
+                   help="e.g. --subset train-clean-100 train-clean-360 (merged into one manifest)")
     p.add_argument("--root", type=Path, default=Path("data/raw/LibriSpeech"))
     p.add_argument("--out", type=Path, default=None)
     p.add_argument("--seed", type=int, default=42)
     a = p.parse_args()
-    build_manifest(a.root / a.subset, a.out or Path(f"data/manifests/{a.subset}.csv"), a.seed)
+    name = "+".join(a.subset)
+    build_manifest([a.root / s for s in a.subset], a.out or Path(f"data/manifests/{name}.csv"), a.seed)
