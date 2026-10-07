@@ -10,9 +10,13 @@ Three numbers come out:
 2. **Enroll-and-identify on unseen speakers** — each new speaker is enrolled with ~10 s
    of speech from one chapter, then their utterances from other chapters are identified
    among all enrolled speakers. This is the "add a new person without retraining" scenario.
-3. **Closed-set test on known speakers** — the 251 training speakers are enrolled from their
+3. **Closed-set test on known speakers** — the training speakers are enrolled from their
    training utterances and the test split is identified by nearest embedding, which is
-   directly comparable with the phase-1 classifier.
+   directly comparable with the classifier head.
+
+Results are printed and saved as soon as each stage finishes (embed_results.partial.json),
+so a problem in the long known-speaker stage never loses the unseen-speaker numbers.
+Files that cannot be read are skipped and listed instead of stopping the evaluation.
 """
 from __future__ import annotations
 
@@ -24,6 +28,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from .data import load_audio
@@ -31,16 +36,50 @@ from .model import build_model
 
 
 # --------------------------------------------------------------------------- embeddings
+class _Utterances(Dataset):
+    """Full utterances capped at max_len samples; an unreadable file comes back as None."""
+
+    def __init__(self, paths: list[str], sample_rate: int, max_len: int):
+        self.paths, self.sr, self.max_len = paths, sample_rate, max_len
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def __getitem__(self, i: int):
+        try:
+            wav = load_audio(self.paths[i], self.sr)[: self.max_len]
+        except (RuntimeError, OSError) as err:
+            return None, i, f"{type(err).__name__}: {err}"
+        return torch.from_numpy(np.ascontiguousarray(wav)), i, None
+
+
+def _first(batch):  # batch_size=1; module-level so it can be pickled for Windows worker processes
+    return batch[0]
+
+
 @torch.no_grad()
-def extract(model, paths: list[str], cfg: dict, device, desc: str = "embedding") -> torch.Tensor:
+def extract(model, paths: list[str], cfg: dict, device, desc: str = "embedding",
+            skipped: list | None = None) -> tuple[torch.Tensor, np.ndarray]:
+    """L2-normalised embeddings of the readable files (in order) and a mask of which files were read.
+    Audio is loaded by background workers while the GPU computes embeddings."""
     model.eval()
     sr = cfg["data"]["sample_rate"]
     max_len = int(cfg.get("eval", {}).get("max_utt_seconds", 20) * sr)
+    workers = min(8, int(cfg["train"].get("num_workers", 0)))
+    dl = DataLoader(_Utterances(paths, sr, max_len), batch_size=1, num_workers=workers, collate_fn=_first)
+    ok = np.ones(len(paths), dtype=bool)
     out = []
-    for p in tqdm(paths, desc=desc, leave=False):
-        wav = torch.from_numpy(load_audio(p, sr))[:max_len].to(device)
-        out.append(F.normalize(model.embed(wav.unsqueeze(0)).float(), dim=-1).cpu())
-    return torch.cat(out)
+    for wav, i, err in tqdm(dl, desc=desc, leave=False):
+        if wav is None:
+            ok[i] = False
+            print(f"\n⚠ skipped unreadable file: {paths[i]} ({err})")
+            if skipped is not None:
+                skipped.append(paths[i])
+            continue
+        out.append(F.normalize(model.embed(wav.to(device).unsqueeze(0)).float(), dim=-1).cpu())
+    if not out:
+        raise RuntimeError(f"none of the {len(paths)} files could be read")
+    return torch.cat(out), ok
 
 
 # --------------------------------------------------------------------------- metrics
@@ -98,19 +137,38 @@ def enroll_and_identify(emb: torch.Tensor, df: pd.DataFrame, enroll_seconds: flo
             "n_speakers": len(names), "n_test_utterances": len(test_idx)}
 
 
-def closed_set(model, df: pd.DataFrame, cfg: dict, device, per_speaker: int, seed: int = 0) -> dict:
+def closed_set(model, df: pd.DataFrame, cfg: dict, device, per_speaker: int, seed: int = 0,
+               skipped: list | None = None) -> dict:
     tr = df[df["split"] == "train"].sample(frac=1, random_state=seed).groupby("speaker").head(per_speaker)
     te = df[df["split"] == "test"]
-    e_tr = extract(model, tr["path"].tolist(), cfg, device, "enroll known")
-    e_te = extract(model, te["path"].tolist(), cfg, device, "test known")
+    e_tr, ok_tr = extract(model, tr["path"].tolist(), cfg, device, "enroll known", skipped)
+    tr = tr[ok_tr]
+    e_te, ok_te = extract(model, te["path"].tolist(), cfg, device, "test known", skipped)
+    te = te[ok_te]
     names = sorted(tr["speaker"].unique())
     spk = tr["speaker"].to_numpy()
     C = F.normalize(torch.stack([e_tr[torch.from_numpy(spk == s)].mean(0) for s in names]), dim=-1)
-    scores = e_te @ C.T
-    truth = torch.tensor([names.index(s) for s in te["speaker"]])
+    known = te["speaker"].isin(set(names)).to_numpy(copy=True)  # in case a speaker lost every enrollment file
+    scores = e_te[torch.from_numpy(known)] @ C.T
+    truth = torch.tensor([names.index(s) for s in te["speaker"][known]])
     return {"top1": float((scores.argmax(1) == truth).float().mean()),
             "top5": float((scores.topk(5, dim=1).indices == truth[:, None]).any(1).float().mean()),
-            "n_speakers": len(names), "n_test_utterances": len(te)}
+            "n_speakers": len(names), "n_test_utterances": int(known.sum())}
+
+
+# --------------------------------------------------------------------------- reporting
+def print_unseen(results: dict, enroll_seconds: float) -> None:
+    v, e = results["unseen_verification"], results["unseen_enroll_identify"]
+    print(f"\nUNSEEN · verification on {v['n_speakers']} speakers · EER {100 * v['eer']:.2f} % · "
+          f"minDCF(0.01) {v['min_dcf']:.3f} · threshold {v['eer_threshold']:.3f}")
+    print(f"UNSEEN · enroll {enroll_seconds} s → identify among {e['n_speakers']} speakers "
+          f"(≥ 2 sessions) · top-1 {e['top1']:.3f} · top-5 {e['top5']:.3f}")
+
+
+def print_known(results: dict) -> None:
+    k = results["known_closed_set"]
+    print(f"\nKNOWN · identify by embedding among {k['n_speakers']} speakers · "
+          f"top-1 {k['top1']:.3f} · top-5 {k['top5']:.3f}")
 
 
 # --------------------------------------------------------------------------- main
@@ -123,11 +181,20 @@ def main() -> None:
     ck = torch.load(a.ckpt, map_location="cpu", weights_only=False)
     cfg, label_map = ck["cfg"], ck["label_map"]
     ev = cfg.get("eval", {})
+    enroll_seconds = ev.get("enroll_seconds", 10)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = build_model(cfg, len(label_map)).to(device)
     model.load_state_dict(ck["model"])
 
     results: dict = {"checkpoint": str(a.ckpt), "epoch": ck.get("epoch")}
+    skipped: list[str] = []
+    out = a.ckpt.parent / "embed_results.json"
+    partial = a.ckpt.parent / "embed_results.partial.json"
+
+    def save(path: Path) -> None:
+        if skipped:
+            results["skipped_files"] = skipped
+        path.write_text(json.dumps(results, indent=2))
 
     unseen = pd.concat([pd.read_csv(m, dtype={"speaker": str, "chapter": str})
                         for m in ev.get("unseen_manifests", []) if Path(m).exists()], ignore_index=True)
@@ -135,30 +202,26 @@ def main() -> None:
     if overlap:
         raise ValueError(f"{len(overlap)} 'unseen' speakers were in training — check eval.unseen_manifests")
     if len(unseen):
-        emb = extract(model, unseen["path"].tolist(), cfg, device, "unseen speakers")
+        emb, ok = extract(model, unseen["path"].tolist(), cfg, device, "unseen speakers", skipped)
+        unseen = unseen[ok].reset_index(drop=True)
         results["unseen_verification"] = verification(emb, unseen)
-        results["unseen_enroll_identify"] = enroll_and_identify(emb, unseen, ev.get("enroll_seconds", 10))
+        results["unseen_enroll_identify"] = enroll_and_identify(emb, unseen, enroll_seconds)
+        save(partial)
+        print_unseen(results, enroll_seconds)
     else:
         print("⚠ No unseen-speaker manifests found — run: python -m spectre.data --subset dev-clean (and test-clean)")
 
     if not a.skip_closed_set:
         known = pd.read_csv(cfg["data"]["manifest"], dtype={"speaker": str, "chapter": str})
-        results["known_closed_set"] = closed_set(model, known, cfg, device, ev.get("enroll_per_speaker", 20))
+        results["known_closed_set"] = closed_set(model, known, cfg, device,
+                                                 ev.get("enroll_per_speaker", 20), skipped=skipped)
+        save(partial)
+        print_known(results)
 
-    out = a.ckpt.parent / "embed_results.json"
-    out.write_text(json.dumps(results, indent=2))
-
-    print()
-    if "unseen_verification" in results:
-        v, e = results["unseen_verification"], results["unseen_enroll_identify"]
-        print(f"UNSEEN · verification on {v['n_speakers']} speakers · EER {100 * v['eer']:.2f} % · "
-              f"minDCF(0.01) {v['min_dcf']:.3f} · threshold {v['eer_threshold']:.3f}")
-        print(f"UNSEEN · enroll {ev.get('enroll_seconds', 10)} s → identify among {e['n_speakers']} speakers "
-              f"(≥ 2 sessions) · top-1 {e['top1']:.3f} · top-5 {e['top5']:.3f}")
-    if "known_closed_set" in results:
-        k = results["known_closed_set"]
-        print(f"KNOWN · identify by embedding among {k['n_speakers']} speakers · "
-              f"top-1 {k['top1']:.3f} · top-5 {k['top5']:.3f}")
+    save(out)
+    partial.unlink(missing_ok=True)
+    if skipped:
+        print(f"\n⚠ {len(skipped)} unreadable file(s) were skipped (listed in {out.name})")
     print(f"Saved to {out}")
 
 

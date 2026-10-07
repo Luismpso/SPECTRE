@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import random
+import time
 from pathlib import Path
 
 import numpy as np
@@ -90,6 +91,21 @@ def build_manifest(subset_dirs: Path | list[Path], out_csv: Path, seed: int = 42
 
 
 # --------------------------------------------------------------------------- dataset
+_READ_ERRORS = (RuntimeError, OSError)  # soundfile.LibsndfileError is a RuntimeError
+
+
+def _retry(read, attempts: int = 3, wait: float = 0.5):
+    """Run a disk read again when it fails. Decode/I-O errors can be transient (e.g. an
+    antivirus scanning the file at the same moment); a file that fails every time still raises."""
+    for k in range(attempts):
+        try:
+            return read()
+        except _READ_ERRORS:
+            if k == attempts - 1:
+                raise
+            time.sleep(wait * (k + 1))
+
+
 def _to_mono_resampled(wav: np.ndarray, sr: int, sample_rate: int) -> np.ndarray:
     if wav.ndim > 1:
         wav = wav.mean(axis=1)
@@ -101,23 +117,26 @@ def _to_mono_resampled(wav: np.ndarray, sr: int, sample_rate: int) -> np.ndarray
 
 
 def load_audio(path: str, sample_rate: int) -> np.ndarray:
-    wav, sr = sf.read(path, dtype="float32", always_2d=False)
+    wav, sr = _retry(lambda: sf.read(path, dtype="float32", always_2d=False))
     return _to_mono_resampled(wav, sr, sample_rate)
 
 
 def load_segment(path: str, sample_rate: int, n: int, where: str = "random") -> np.ndarray:
     """Read only an n-sample segment from disk (random or centred) instead of the whole file.
     Falls back to a full read when the file needs resampling or is shorter than n."""
-    with sf.SoundFile(path) as f:
-        total, sr = f.frames, f.samplerate
-        if sr != sample_rate or total <= n:
-            wav = f.read(dtype="float32", always_2d=False)
-            return fix_length(_to_mono_resampled(wav, sr, sample_rate), n,
-                              start=None if where == "random" else max(0, (len(wav) - n) // 2))
-        start = np.random.randint(0, total - n + 1) if where == "random" else (total - n) // 2
-        f.seek(start)
-        wav = f.read(n, dtype="float32", always_2d=False)
-    return _to_mono_resampled(wav, sr, sample_rate)
+    def read() -> np.ndarray:
+        with sf.SoundFile(path) as f:
+            total, sr = f.frames, f.samplerate
+            if sr != sample_rate or total <= n:
+                wav = f.read(dtype="float32", always_2d=False)
+                return fix_length(_to_mono_resampled(wav, sr, sample_rate), n,
+                                  start=None if where == "random" else max(0, (len(wav) - n) // 2))
+            start = np.random.randint(0, total - n + 1) if where == "random" else (total - n) // 2
+            f.seek(start)
+            wav = f.read(n, dtype="float32", always_2d=False)
+        return _to_mono_resampled(wav, sr, sample_rate)
+
+    return _retry(read)
 
 
 def fix_length(wav: np.ndarray, n: int, start: int | None = None) -> np.ndarray:
