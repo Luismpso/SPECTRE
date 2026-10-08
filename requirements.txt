@@ -5,6 +5,7 @@ torchaudio>=2.7
 torchvision>=0.22
 timm>=1.0
 soundfile>=0.12
+scipy>=1.10
 numpy
 pandas
 pyyaml

@@ -98,9 +98,10 @@ python -m spectre.live identify              # who is speaking right now? (Ctrl+
 Live captions of a conversation, each line labelled with who said it. Nobody has to be enrolled: the names come from the conversation itself. If Joana says *"Olá João!"* and another voice answers *"Olá Joana, tudo bem?"*, that voice is João (labelled as soon as he starts talking) and the first one is Joana.
 
 ```bash
-pip install transformers rich sounddevice    # Whisper, the live panel, the microphone (or: pip install -e ".[conversation]")
+pip install transformers rich sounddevice scipy   # Whisper, live panel, microphone (or: pip install -e ".[conversation]")
 # local LLM: install Ollama (https://ollama.com), then
 ollama pull gemma3:12b
+python -m spectre.conv_eval                                       # once per model: calibrate the voices (a few minutes)
 python -m spectre.conversation                                    # live, from the microphone (Ctrl+C to stop)
 python -m spectre.conversation --file conversa.wav --realtime     # a recording, played as if it were live
 python -m spectre.conversation --file conversa.wav --save conversa.txt
@@ -108,17 +109,34 @@ python -m spectre.conversation --file conversa.wav --save conversa.txt
 
 Each turn ends at a pause, and is also cut where the voice changes (quick replies). Then:
 
-1. **Voice** — the SPECTRE embedding is clustered online: close enough to a known voice means the same speaker, otherwise a new one; speakers that turn out to be the same voice are merged. People enrolled in phase 3 are recognised by voice and keep their names.
+1. **Voice** — the SPECTRE embedding, with the room compensated (below), is clustered online: close enough to a known voice means the same speaker, otherwise a new one; speakers that turn out to be the same voice are merged. Turns with less than 1 s of speech are too short to trust: they follow the closest voice, and move if a closer one appears later. People enrolled in phase 3 are recognised by voice and keep their names.
 2. **Words** — Whisper (`openai/whisper-large-v3-turbo`, Portuguese by default, `--language auto` to detect) transcribes the turn.
-3. **Names** — a local LLM (Ollama, `gemma3:12b` by default) reads the new line and only says *how* each name appears in it: the speaker's own name ("Eu sou o Pedro"), someone addressed ("Olá João"), introduced ("apresento-te o Pedro") or only mentioned ("A Rita chega mais tarde"). Names that are not written in the line are dropped — small models copy them from the context.
-4. **Who is who** — turn-taking rules turn those cues into evidence for each voice: their own name +3; the next *other* voice after a name is called or introduced +2; the previous other voice when a reply uses a name ("Olá Joana, tudo bem?") +2; saying a name to or about someone else −3 for that name. A voice needs 2 points and each name goes to one voice. Names are applied to earlier lines too, and the end of the session lists the evidence for each name.
+3. **Names** — a local LLM (Ollama, `gemma3:12b` by default) reads the new line and only says *how* each name appears in it: the speaker's own name ("Eu sou o Pedro"), someone addressed ("Olá João"), introduced ("apresento-te o Pedro") or only mentioned ("A Rita chega mais tarde"). The code then checks the answer against the words: names not written in the line are dropped (small models copy them from the context), "own name" needs a self-introduction such as *sou*, *chamo-me* or *o meu nome é* ("Olá Joana" calls Joana), and a name after a greeting or set off by commas is someone being addressed.
+4. **Who is who** — turn-taking rules turn those cues into evidence for each voice: their own name +3; the next *other* voice after a name is called or introduced +2; the previous other voice when a reply uses a name ("Olá Joana, tudo bem?") +2 — a name in an answer ("Obrigado, Maria", "O prazer é meu, Pedro") only points back; saying a name to or about someone else −3 for that name. A voice needs 2 points and each name goes to one voice. Names are applied to earlier lines too, and the end of the session lists the evidence for each name.
 
 The LLM only reads and the code decides, so a small local model is enough, each call is one short line and every name can be explained. While someone is still talking, the panel already shows who it is (*▶ João is speaking…*), with the same rules.
 
 - Everything runs locally and audio is never written to disk. `--save` writes the transcript; `--remember` adds the voices that got a name (≥ 8 s of speech) to `enrollments/speakers.json`, so next time they are recognised by voice.
 - `--llm none` gives captions and voices without names; `--llm hf:<model>` uses a Hugging Face chat model instead of Ollama; `ollama:gemma3:4b` is a lighter option. On a 16 GB GPU, Whisper turbo and `gemma3:12b` fit side by side.
-- Tuning: `--cluster-threshold` (default: the model's EER threshold + 0.1) — raise it if two people share a label, lower it if one person shows up as two; `--gap` (0.6 s) — the pause that ends a turn.
-- Limits: overlapping speech is not separated, very short turns ("Sim.") are harder to attribute, and someone is only named once their name is said. The voice model was trained on English audiobooks, so similar voices in a noisy room may be merged; enrolling people (phase 3) avoids that.
+- Tuning: `--cluster-threshold` (default: the calibration, or 0.65 without one) — raise it if two people share a label, lower it if one person shows up as two; `--gap` (0.6 s) — the pause that ends a turn.
+- Limits: overlapping speech is not separated, very short turns ("Sim.") are harder to attribute, and someone is only named once their name is said. Similar voices can still be merged, mostly when people answer each other very quickly; enrolling them (phase 3) avoids that.
+
+### Voices around one microphone
+
+Every LibriSpeech speaker reads in their own room with their own microphone, so a model trained on it learns that the channel is part of the voice. Around one microphone everyone shares the channel, and different people suddenly look alike: on the same simulated conversations, two *different* speakers typically score 0.04 when each voice is played as recorded, but 0.36–0.47 once they all go through one room (reverberation, microphone colour, background noise). The same person barely changes. A threshold taken from LibriSpeech (0.27 at the EER point) therefore merges people.
+
+`python -m spectre.conv_eval` measures and corrects this for each model, with voices it never heard:
+
+1. **Room compensation** — dev-clean clips are played in simulated rooms; the directions in which a room moves the embeddings are learned and removed from every embedding afterwards (nuisance attribute projection), from the first turn on.
+2. **Calibration** — 150 one-microphone conversations between 2–4 test-clean speakers (other people than in step 1; answers 0.15–1 s after the other person stops, some within one turn) go through exactly the live pipeline. The settings that give the most speech to the right person, without inventing extra speakers, are saved next to the model (`runs/<run>/conversation.json`) and used automatically.
+
+| Voice rules (1,172-speaker model) | Speech given to the right person | Conversations with two people merged |
+|---|---|---|
+| First version: threshold from LibriSpeech (EER + 0.1) | 56.6 % | 88 % |
+| Calibrated threshold + rule for short turns | 85.8 % | 39 % |
+| + room compensation | **89.1 %** | **31 %** |
+
+The remaining errors come from the model itself, which still carries the room; training it with reverberation and microphone augmentation is the natural next step.
 
 ## Structure
 
@@ -136,6 +154,8 @@ src/spectre/
   embed_eval.py EER / minDCF, enroll-and-identify, closed-set by embedding
   live.py       live demo: enrollment, voice activity detection, real-time identification
   conversation.py  live captions: turns, voice clustering, Whisper, names from context (local LLM)
+  room.py       simulated rooms and one-microphone conversations
+  conv_eval.py  room compensation and voice calibration for conversations
 tests/        fast tests for phases 3–4 (no data, GPU, microphone or Ollama needed): pytest -q
 ```
 

@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 import soundfile as sf
 
+from spectre import conv_eval, room
 from spectre import conversation as cv
 from spectre import live
 
@@ -128,8 +129,11 @@ def turns_of(wav: np.ndarray, sr: int, **kw) -> list[cv.Turn]:
     return [t for s in range(0, len(wav), block) for t in seg.push(wav[s: s + block])] + seg.flush()
 
 
+RULES = dict(threshold=0.6, cut=0.6, merge_margin=0.2, follow_below_s=1.0, new_margin=0.3, min_cut_side_s=0.6)
+
+
 def make_conversation(reader=None, enrolled=None) -> cv.Conversation:
-    return cv.Conversation(FakeEmbedder(), FakeTranscriber(), reader, cv.Voices(0.6, 0.8, enrolled))
+    return cv.Conversation(FakeEmbedder(), FakeTranscriber(), reader, cv.Voices(cv.VoiceRules(**RULES), enrolled))
 
 
 def process(conv: cv.Conversation, turns: list[cv.Turn]) -> None:
@@ -198,26 +202,64 @@ def unit(v):
 
 def test_voices_new_speakers_merge_and_forget():
     a, b, other = np.eye(4)[0], np.eye(4)[1], np.eye(4)[3]
-    v = cv.Voices(threshold=0.9, merge_threshold=0.75)
-    assert v.assign(a, 2.0) == 0 and v.assign(unit(a + 0.2 * b), 1.0) == 0      # close enough: same speaker
-    assert v.assign(b, 1.0) == 1 and v.clusters[1]["label"] == "Speaker 2"
-    assert v.assign(unit(a + 0.6 * b), 1.0) == 2                               # not sure yet: a new speaker...
-    assert v.merge() == {2: 0} and sorted(v.clusters) == [0, 1]                # ...that turns out to be the first
-    noise = v.assign(other, 0.4)
+    v = cv.Voices(cv.VoiceRules(threshold=0.9, merge_margin=-0.15))       # merge at 0.75
+    assert v.assign(a, 2.0) == (0, False) and v.assign(unit(a + 0.2 * b), 1.0) == (0, False)   # same speaker
+    assert v.assign(b, 1.0) == (1, False) and v.clusters[1]["label"] == "Speaker 2"
+    assert v.assign(unit(a + 0.6 * b), 1.0) == (2, False)                   # not sure yet: a new speaker...
+    assert v.merge() == {2: 0} and sorted(v.clusters) == [0, 1]             # ...that turns out to be the first
+    noise, _ = v.assign(other, 1.2)
     assert v.clusters[noise]["label"] == "Speaker 4"
-    v.unassign(noise, other, 0.4)                                              # it was only noise
+    v.unassign(noise, other, 1.2)                                           # it was only noise
     assert sorted(v.clusters) == [0, 1] and v.next_label == 4
     assert v.closest(b) == (1, pytest.approx(1.0))
 
 
+def test_short_turns_follow_the_closest_voice():
+    a, b, c = np.eye(4)[0], np.eye(4)[1], np.eye(4)[2]
+    v = cv.Voices(cv.VoiceRules(threshold=0.6, new_margin=0.3))             # a new voice below 0.3
+    lines = [cv.Line(0, 2, *v.assign(a, 2.0)[:1], 2.0, emb=a)]
+    short = unit(0.8 * a + c)                                               # 0.62 to A: the closest voice so far
+    spk, follows = v.assign(short, 0.5)
+    assert (spk, follows) == (0, True) and np.allclose(v.clusters[0]["sum"], 2 * a)   # A is not changed by it
+    lines.append(cv.Line(2, 2.5, spk, 0.5, emb=short, follows=True))
+    assert v.assign(b, 0.4) == (1, False)                                   # clearly nobody known: a new voice
+    spk, _ = v.assign(c, 2.0)                                               # a long turn by someone new...
+    lines.append(cv.Line(3, 5, spk, 2.0, emb=c))
+    cv.relabel(lines, v)
+    assert lines[1].speaker == spk                                          # ...was who said the short turn
+
+
+def test_room_compensation():
+    a, b, r = np.eye(4)[0], np.eye(4)[1], np.eye(4)[3]
+    e1, e2 = unit(a + 2 * r), unit(b + 2 * r)                               # two people, one shared room
+    assert e1 @ e2 > 0.75
+    rules = cv.VoiceRules(room=r[None, :])
+    p1, p2 = rules.project(np.stack([e1, e2]))
+    assert abs(p1 @ p2) < 1e-6 and np.allclose(np.linalg.norm([p1, p2], axis=1), 1)
+    assert np.allclose(cv.VoiceRules().project(e1), e1)                     # without a calibration: unchanged
+
+
+def test_calibration_file(tmp_path):
+    run = tmp_path / "run_x"
+    run.mkdir()
+    assert cv.VoiceRules.for_model(run / "best.pt", "run_x/best.pt") == cv.VoiceRules()
+    (run / cv.CALIBRATION).write_text(json.dumps(
+        {"model": "run_x/best.pt", "threshold": 0.4, "cut": 0.3, "merge_margin": 0.2, "follow_below_s": 1.0,
+         "new_margin": 0.3, "min_cut_side_s": 0.8, "room_directions": [[0, 0, 0, 1.0]], "accuracy": 0.913}))
+    rules = cv.VoiceRules.for_model(run / "best.pt", "run_x/best.pt")
+    assert (rules.threshold, rules.cut, rules.merge, rules.new_voice) == (0.4, 0.3, pytest.approx(0.6), pytest.approx(0.1))
+    assert rules.room.shape == (1, 4) and "91 %" in rules.summary
+    assert cv.VoiceRules.for_model(run / "best.pt", "other/best.pt").room is None   # made for another model
+
+
 def test_enrolled_voices_are_fixed():
     a, b = np.eye(4)[0], np.eye(4)[1]
-    v = cv.Voices(0.6, 0.5, {"Ana": a, "Rui": unit(a + 0.5 * b)})
-    assert v.merge() == {}                                                     # two enrolled people never merge
-    assert v.assign(unit(a + 0.1 * b), 3.0) == 0 and np.allclose(v.clusters[0]["sum"], a)   # reference unchanged
-    w = cv.Voices(0.9, 0.7, {"Ana": a})
-    new = w.assign(unit(a + 0.7 * b), 2.0)
-    assert new == 1 and w.merge() == {1: 0} and w.fixed_names() == {0: "Ana"}  # merging into Ana keeps Ana
+    v = cv.Voices(cv.VoiceRules(threshold=0.6, merge_margin=-0.1), {"Ana": a, "Rui": unit(a + 0.5 * b)})
+    assert v.merge() == {}                                                  # two enrolled people never merge
+    assert v.assign(unit(a + 0.1 * b), 3.0) == (0, False) and np.allclose(v.clusters[0]["sum"], a)   # unchanged
+    w = cv.Voices(cv.VoiceRules(threshold=0.9, merge_margin=-0.2), {"Ana": a})
+    assert w.assign(unit(a + 0.7 * b), 2.0) == (1, False)
+    assert w.merge() == {1: 0} and w.fixed_names() == {0: "Ana"}            # merging into Ana keeps Ana
 
 
 # --------------------------------------------------------------------------- reading names
@@ -231,6 +273,38 @@ def test_parse_names_keeps_only_names_written_in_the_line():
     assert cv.parse_names(both, "Eu sou o Pedro") == [("Pedro", "self")]
     assert cv.parse_names("no idea", "Olá João") == [] and cv.parse_names("{broken", "Olá João") == []
     assert cv.parse_names('{"names": [{"name": "João", "role": "friend"}]}', "Olá João") == []
+
+
+def test_own_name_needs_a_self_introduction():
+    for line, name in [("Eu sou o Pedro.", "Pedro"), ("Chamo-me Ana.", "Ana"), ("O meu nome é Rui.", "Rui"),
+                       ("Olá, aqui é a Joana!", "Joana"), ("Muito prazer, João. Eu sou o Pedro.", "Pedro")]:
+        assert cv.says_own_name(name, line), line
+    assert not cv.says_own_name("Tedo", "O prazer é meu, Tedo.")             # a vocative, not a name of one's own
+    assert not cv.says_own_name("João", "Muito prazer, João. Eu sou o Pedro.")
+    misread = '{"names": [{"name": "Tedo", "role": "self"}, {"name": "Rita", "role": "mentioned"}]}'
+    assert cv.parse_names(misread, "O prazer é meu, Tedo. A Rita também vem?") == [("Tedo", "replied"), ("Rita", "mentioned")]
+    assert cv.parse_names('{"names": [{"name": "Joana", "role": "self"}]}', "Olá Joana, tudo bem contigo?") == \
+        [("Joana", "addressed")]                                             # what gemma3:4b got wrong
+    assert cv.parse_names('{"names": [{"name": "Ana", "role": "self"}]}', "A Ana chegou.") == []
+
+
+def test_vocatives():
+    assert cv.vocative("Pedro", "O prazer é meu, Pedro.") == "answer"         # Pedro spoke before
+    assert cv.vocative("Maria", "Obrigado, Maria!") == "answer"
+    for name, line in [("João", "Olá João! Há quanto tempo."), ("Joana", "Olá, Joana. Tudo bem?"),
+                       ("Pedro", "Pedro, anda cá."), ("Pedro", "Anda cá, Pedro!"), ("João", "Muito prazer, João.")]:
+        assert cv.vocative(name, line) == "call", line
+    for name, line in [("Pedro", "Eu sou o Pedro."), ("Rita", "A Rita chega mais tarde."),
+                       ("Pedro", "Apresento-te o Pedro, trabalha comigo.")]:
+        assert cv.vocative(name, line) is None, line
+
+
+def test_a_name_closing_a_reply_points_back():
+    lines = [line(0, [("Pedro", "introduced")]), line(1, [("Pedro", "self")]),
+             line(2, [("Pedro", "replied")]), line(0, [])]                  # "…, Pedro." then Joana speaks
+    names = cv.resolve_names(lines, {})
+    assert names[1].name == "Pedro" and len(names) == 1                    # Joana (voice 0) gets nothing
+    assert names[1].evidence[-1] == 'line 3: called "Pedro" in the reply to line 2'
 
 
 # --------------------------------------------------------------------------- deciding who is who
@@ -346,6 +420,34 @@ def test_plain_output_transcript_and_live_panel():
     assert "voices: Joana, João, Pedro" in out
 
 
+# --------------------------------------------------------------------------- calibration on simulated conversations
+def test_room_simulation_and_score():
+    rng = np.random.default_rng(1)
+    x = tone(200, 2.0)
+    y = room.apply_room(x, room.make_room(rng), rng)
+    assert len(y) == len(x) and y.dtype == np.float32 and 0.01 < np.abs(y).max() <= 0.95
+    truth = [(0.0, 2.0, "A"), (2.5, 4.0, "B")]
+    assert room.score([(0.0, 2.0, 7), (2.5, 4.0, 9)], truth) == {"accuracy": 1.0, "speakers": 2, "labels": 2, "merged": 0}
+    merged = room.score([(0.0, 2.0, 7), (2.5, 4.0, 7)], truth)
+    assert merged["merged"] == 1 and merged["accuracy"] == pytest.approx(2.0 / 3.5)
+
+
+def test_calibration_runs_the_live_rules():
+    conv = {"truth": [], "turns": turns_of(dialogue(), SR)}
+    t = 1.0
+    for who, *_ in SCRIPT:
+        conv["truth"].append((t, t + 1.6, who))
+        t += 2.6
+    embed = conv_eval.CachedEmbedder(FakeEmbedder())
+    lines = conv_eval.run_rules(conv, embed, cv.VoiceRules(**RULES))
+    assert len(lines) == 7 and room.score(lines, conv["truth"])["accuracy"] == pytest.approx(1.0, abs=0.01)
+    n = len(embed.cache)
+    conv_eval.run_rules(conv, embed, cv.VoiceRules(**RULES))
+    assert len(embed.cache) == n                                            # the second pass uses the cache
+    rules, result, base = conv_eval.calibrate([conv], embed, np.eye(4)[3:4], log=lambda *a: None)
+    assert result["accuracy"] > 0.99 and result["merged"] == 0 and base["accuracy"] > 0.99
+
+
 # --------------------------------------------------------------------------- Ollama
 class FakeOllama(BaseHTTPRequestHandler):
     requests: list = []
@@ -403,11 +505,15 @@ def fakes(monkeypatch):
 
 
 def test_cli_over_a_recording(tmp_path, fakes, capsys):
-    path, bank = tmp_path / "conversa.flac", tmp_path / "speakers.json"
+    path, bank, run = tmp_path / "conversa.flac", tmp_path / "speakers.json", tmp_path / "run_x"
     sf.write(path, dialogue(44100, seconds=4.5), 44100)              # long enough to remember the voices
-    cv.main(["--file", str(path), "--ckpt", "x.pt", "--bank", str(bank), "--cluster-threshold", "0.6",
+    run.mkdir()
+    (run / cv.CALIBRATION).write_text(json.dumps({"model": "run_x/best.pt", **RULES, "room_directions": [],
+                                                  "accuracy": 0.9}))
+    cv.main(["--file", str(path), "--ckpt", str(run / "best.pt"), "--bank", str(bank),
              "--save", str(tmp_path / "conversa.txt"), "--remember"])
     out = capsys.readouterr().out
+    assert "calibrated for one-microphone conversations" in out and "same speaker above 0.60" in out
     assert "↳ Speaker 2 is João" in out and "How the names were found:" in out
     assert "Pedro: Então vamos andando." in (tmp_path / "conversa.txt").read_text(encoding="utf-8")
     assert sorted(live.SpeakerBank(bank).speakers) == ["Joana", "João", "Pedro"]

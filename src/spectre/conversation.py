@@ -169,15 +169,61 @@ def split_by_voice(turn: Turn, embedder, threshold: float, min_side_s: float = 0
 
 
 # =========================================================================== voices
-class Voices:
-    """Online speaker clustering on SPECTRE embeddings. Enrolled people (phase 3) are fixed, named clusters."""
+CALIBRATION = "conversation.json"         # written next to the model by `python -m spectre.conv_eval`
 
-    def __init__(self, threshold: float, merge_threshold: float, enrolled: dict[str, np.ndarray] | None = None):
-        self.threshold, self.merge_threshold = threshold, merge_threshold
+
+@dataclass
+class VoiceRules:
+    """How turns are given to voices. The defaults work without calibration; `python -m spectre.conv_eval`
+    measures the best values for a model on simulated one-microphone conversations and saves them next to it."""
+    threshold: float = 0.65           # a turn joins a voice when it is at least this similar to it
+    cut: float = 0.5                  # a short pause inside a turn is cut when the voices around it are below this
+    merge_margin: float = 0.2         # two voices are merged when their similarity reaches threshold + this
+    follow_below_s: float = 1.0       # turns with less speech follow the closest voice…
+    new_margin: float = 0.45          # …unless they are below threshold − this: clearly someone new
+    min_cut_side_s: float = 0.8       # speech needed on each side of a pause to judge a change of voice
+    room: np.ndarray | None = None    # directions removed from every embedding (what one room adds to all voices)
+    summary: str = ""                 # what the calibration measured
+
+    @property
+    def merge(self) -> float:
+        return self.threshold + self.merge_margin
+
+    @property
+    def new_voice(self) -> float:
+        return self.threshold - self.new_margin
+
+    def project(self, E: np.ndarray) -> np.ndarray:
+        """Room compensation: remove the room directions from the embeddings and renormalise them."""
+        E = np.atleast_2d(np.asarray(E, float))
+        if self.room is not None and len(self.room):
+            E = E - (E @ self.room.T) @ self.room
+        return E / (np.linalg.norm(E, axis=1, keepdims=True) + 1e-12)
+
+    @classmethod
+    def for_model(cls, ckpt: Path, model_id: str) -> "VoiceRules":
+        """The calibration saved next to the model, or the defaults when there is none (or it is for another model)."""
+        f = Path(ckpt).parent / CALIBRATION
+        d = json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
+        if d.get("model") != model_id:
+            return cls()
+        return cls(threshold=d["threshold"], cut=d["cut"], merge_margin=d["merge_margin"],
+                   follow_below_s=d["follow_below_s"], new_margin=d["new_margin"], min_cut_side_s=d["min_cut_side_s"],
+                   room=np.asarray(d["room_directions"], float) if d.get("room_directions") else None,
+                   summary=f"{100 * d['accuracy']:.0f} % of the speech to the right person in simulated rooms")
+
+
+class Voices:
+    """Online speaker clustering. Turns with enough speech lead: they shape the voices. Short turns, whose
+    embeddings are unreliable, follow the closest voice and move if a closer one appears later. Enrolled people
+    (phase 3) are fixed voices."""
+
+    def __init__(self, rules: VoiceRules, enrolled: dict[str, np.ndarray] | None = None):
+        self.rules = rules
         self.clusters: dict[int, dict] = {}
         self.next_label = 1
         for name, c in (enrolled or {}).items():
-            self.clusters[len(self.clusters)] = {"sum": np.asarray(c, float), "embs": [], "seconds": 0.0,
+            self.clusters[len(self.clusters)] = {"sum": rules.project(c)[0], "embs": [], "seconds": 0.0,
                                                  "fixed": name, "label": name}
 
     @staticmethod
@@ -192,10 +238,12 @@ class Voices:
                 best, best_sim = cid, sim
         return best, best_sim
 
-    def assign(self, emb: np.ndarray, seconds: float) -> int:
-        """Cluster id for a new turn embedding (a new speaker when nobody is close enough)."""
+    def assign(self, emb: np.ndarray, seconds: float) -> tuple[int, bool]:
+        """(voice id, True if the turn only follows that voice). A new voice when nobody is close enough."""
         best, sim = self.closest(emb)
-        if best is None or sim < self.threshold:
+        if best is not None and seconds < self.rules.follow_below_s and sim >= self.rules.new_voice:
+            return best, True
+        if best is None or sim < self.rules.threshold:
             best = max(self.clusters, default=-1) + 1
             self.clusters[best] = {"sum": np.zeros_like(emb, dtype=float), "embs": [], "seconds": 0.0,
                                    "fixed": None, "label": f"Speaker {self.next_label}"}
@@ -205,7 +253,7 @@ class Voices:
             c["sum"] = c["sum"] + emb * max(seconds, 0.5)
         c["embs"].append(emb)
         c["seconds"] += seconds
-        return best
+        return best, False
 
     def unassign(self, cid: int, emb: np.ndarray, seconds: float) -> None:
         """Undo an assignment (the turn was only noise); a speaker left without turns disappears."""
@@ -236,7 +284,7 @@ class Voices:
                     A, B = self.clusters[a], self.clusters[b]
                     if A["fixed"] and B["fixed"]:
                         continue
-                    if float(self._unit(A["sum"]) @ self._unit(B["sum"])) >= self.merge_threshold:
+                    if float(self._unit(A["sum"]) @ self._unit(B["sum"])) >= self.rules.merge:
                         keep, drop = (a, b) if (A["fixed"] or A["seconds"] >= B["seconds"]) and not B["fixed"] else (b, a)
                         K, D = self.clusters[keep], self.clusters.pop(drop)
                         if K["fixed"] is None:
@@ -255,8 +303,9 @@ class Voices:
 # =========================================================================== reading names with an LLM
 SYSTEM_PROMPT = """You read one new line of a transcribed conversation (the previous lines are only context) and
 list the people's names written in that NEW line, saying how each one appears:
-- "self": the speaker says it is their own name ("Eu sou o Pedro", "Chamo-me Ana", "O meu nome é Rui").
-- "addressed": the speaker talks TO that person, calling them by name ("Olá João", "Obrigado, Maria", "Pedro, anda cá").
+- "self": the speaker says it is their own name ("Eu sou o Pedro", "Chamo-me Ana", "O meu nome é Rui", "Aqui é a Joana").
+- "addressed": the speaker talks TO that person, calling them by name ("Olá João", "Obrigado, Maria", "Pedro, anda cá",
+  "O prazer é meu, Pedro"). A name set off by a comma at the start or end of a sentence is someone being addressed.
 - "introduced": the speaker presents that person to someone ("apresento-te o Pedro", "esta é a Ana").
 - "mentioned": the person is only talked about ("A Rita chega mais tarde").
 Only names written in the NEW line count, spelled as they are written there. Titles or family words on their own
@@ -280,6 +329,52 @@ def written_in(name: str, line: str) -> bool:
                                for w in words for p in parts)
 
 
+SELF_CUES = {"sou", "chamo", "chamam", "nome", "aqui", "fala", "am", "name"}
+
+
+def says_own_name(name: str, line: str) -> bool:
+    """A self-introduction word shortly before the name ("Eu sou o Pedro", "Chamo-me Ana", "O meu nome é Rui",
+    "Aqui é a Joana"). Without one, "self" is a misreading — "O prazer é meu, Pedro" calls Pedro."""
+    words = re.findall(r"[^\W\d_]+", fold(line))
+    first = next((p for p in re.findall(r"[^\W\d_]+", fold(name)) if len(p) > 1), "")
+    return any((w == first or (len(first) >= 4 and SequenceMatcher(None, w, first).ratio() >= 0.85))
+               and SELF_CUES & set(words[max(0, k - 3): k]) for k, w in enumerate(words)) if first else False
+
+
+CALLING = r"(?:ola|oi|bom dia|boa tarde|boa noite|adeus|tchau|ate logo|ate amanha|muito prazer|prazer|bem-vind[oa]|hello|hi)"
+ANSWERING = r"(?:muito obrigad[oa]|obrigad[oa]|o prazer e meu|de nada|igualmente|desculp[ae]|thanks|thank you)"
+
+
+def vocative(name: str, line: str) -> str | None:
+    """How a name calls someone, from the words around it: "answer" right after thanks or a reply ("Obrigado,
+    Maria", "O prazer é meu, Pedro") — that person spoke before; "call" after a greeting or set off by a comma
+    ("Olá, João", "Pedro, anda cá", "Anda cá, Pedro!"); None when the name is not a vocative."""
+    first = next((p for p in re.findall(r"[^\W\d_]+", fold(name)) if len(p) > 1), "")
+    if not first:
+        return None
+    t, n = fold(line), re.escape(first)
+    if re.search(rf"\b{ANSWERING}\s*[,!]?\s*{n}\b", t):
+        return "answer"
+    if (re.search(rf"\b{CALLING}\s*[,!]?\s*{n}\b", t) or re.search(rf",\s*{n}\b\s*(?:[.!?…]|$)", t)
+            or re.search(rf"(?:^|[.!?]\s+){n}\s*,", t)):
+        return "call"
+    return None
+
+
+def check_role(name: str, role: str, line: str) -> str | None:
+    """Correct the usual misreadings with the words themselves: "self" needs a self-introduction ("Olá Joana" calls
+    Joana); a vocative is someone addressed; one that answers ("O prazer é meu, Pedro") points back to that person."""
+    v = vocative(name, line)
+    if role == "self" and not says_own_name(name, line):
+        role = "addressed" if v else None
+    elif role == "mentioned" and v:
+        role = "addressed"
+    return "replied" if role == "addressed" and v == "answer" else role
+
+
+PRIORITY = ("self", "addressed", "replied", "introduced", "mentioned")
+
+
 def parse_names(answer: str, line: str) -> list[tuple[str, str]]:
     """LLM answer (JSON) → [(name, role)] keeping only names written in the line, one role per name."""
     m = re.search(r"\{.*\}", answer or "", re.S)
@@ -294,8 +389,11 @@ def parse_names(answer: str, line: str) -> list[tuple[str, str]]:
         name, role = str(it.get("name", "")).strip(), str(it.get("role", "")).strip().lower()
         if role not in ROLES or not name or not written_in(name, line):
             continue
+        role = check_role(name, role, line)
+        if role is None:                                                # a misreading: not evidence of anything
+            continue
         k = fold(name)
-        if k not in best or ROLES.index(role) < ROLES.index(best[k][1]):   # self > addressed > introduced > mentioned
+        if k not in best or PRIORITY.index(role) < PRIORITY.index(best[k][1]):   # one role per name
             best[k] = (name, role)
     return list(best.values())
 
@@ -393,7 +491,9 @@ class Line:
     seconds: float
     text: str | None = None                       # None while being transcribed
     names: list[tuple[str, str]] | None = None    # None until the LLM has read it
-    emb: np.ndarray | None = field(default=None, repr=False)
+    emb: np.ndarray | None = field(default=None, repr=False)   # room-compensated voice embedding
+    raw: np.ndarray | None = field(default=None, repr=False)   # as the model gives it (what --remember saves)
+    follows: bool = False                         # a short turn: it follows the closest voice
 
 
 @dataclass
@@ -411,6 +511,7 @@ def resolve_names(lines: list[Line], fixed: dict[int, str], min_score: float = 2
     - "Eu sou o Pedro"                    → the speaker is Pedro                                    (+3)
     - "Olá João" / "apresento-te o João"  → the next *other* voice is João                          (+2)
     - "Olá Joana, tudo bem?"              → the previous *other* voice is Joana (answering by name) (+2)
+      (a name in an answer — "Obrigado, Maria", "O prazer é meu, Pedro" — only points back)
     - saying a name to or about someone   → the speaker is not that person                         (−3)
       ("Olá João", "A Rita chega mais tarde": nobody gains the name Rita)
     The evidence adds up, so one misheard or misread line can be outweighed. A voice needs at least
@@ -443,13 +544,13 @@ def resolve_names(lines: list[Line], fixed: dict[int, str], min_score: float = 2
                 add(sp[i], key, WEIGHTS["self"], f'line {i + 1}: said their name ("{name}")', i)
                 continue
             add(sp[i], key, WEIGHTS["said_it"], "", i)
-            if role in ("addressed", "introduced"):
+            if role in ("addressed", "introduced"):                     # not "replied"
                 j = other(i, +1)
                 if j is not None:
                     verb = "called" if role == "addressed" else "introduced"
                     add(sp[j], key, WEIGHTS["spoke_after"], f'line {j + 1}: spoke right after "{name}" was {verb} '
                         f'(line {i + 1})', j)
-            if role == "addressed":
+            if role in ("addressed", "replied"):
                 j = other(i, -1)
                 if j is not None:
                     add(sp[j], key, WEIGHTS["answered_with"], f'line {i + 1}: called "{name}" in the reply to '
@@ -496,6 +597,16 @@ class Transcriber:
 
 
 # =========================================================================== the conversation
+def relabel(lines: list[Line], voices: Voices) -> None:
+    """After a change: merge voices that turned out to be one, and let short turns follow the closest voice."""
+    moved = voices.merge()
+    for ln in lines:
+        ln.speaker = moved.get(ln.speaker, ln.speaker)
+        if ln.follows:
+            cid, _ = voices.closest(ln.emb)
+            ln.speaker = ln.speaker if cid is None else cid
+
+
 class Conversation:
     """Holds the lines, the voices and the current names. A turn is processed in two stages: hear (voice,
     then transcription — the caption appears) and read (the LLM — names may appear, also on earlier lines)."""
@@ -510,19 +621,23 @@ class Conversation:
         self.reader_error: str | None = None
         self.problem: str | None = None
 
+    def embed(self, wavs) -> np.ndarray:
+        """Voice embeddings with the room compensation of the rules."""
+        return self.voices.rules.project(self.embedder(wavs))
+
     def split(self, turn: Turn) -> list[Turn]:
-        return split_by_voice(turn, self.embedder, self.voices.threshold)
+        rules = self.voices.rules
+        return split_by_voice(turn, self.embed, rules.cut, rules.min_cut_side_s)
 
     def hear(self, turn: Turn) -> Line | None:
         """Voice and transcription of a finished turn; returns its line (None if it was only noise)."""
-        emb = self.embedder(turn.audio)[0]
+        raw = self.embedder(turn.audio)[0]
+        emb = self.voices.rules.project(raw)[0]
         with self.lock:
-            spk = self.voices.assign(emb, turn.speech_s)
-            moved = self.voices.merge()                         # two speakers turned out to be one voice
-            for ln in self.lines:
-                ln.speaker = moved.get(ln.speaker, ln.speaker)
-            line = Line(turn.start, turn.end, moved.get(spk, spk), turn.speech_s, emb=emb)
+            spk, follows = self.voices.assign(emb, turn.speech_s)
+            line = Line(turn.start, turn.end, spk, turn.speech_s, emb=emb, raw=raw, follows=follows)
             self.lines.append(line)
+            self._relabel()
             self._update_names()                                # the voice may already have a name
         self.on_change()
         try:
@@ -534,7 +649,9 @@ class Conversation:
                 line.text = text
             else:                                               # a cough, a door...: forget it
                 self.lines.remove(line)
-                self.voices.unassign(line.speaker, emb, turn.speech_s)
+                if not line.follows:
+                    self.voices.unassign(line.speaker, emb, turn.speech_s)
+                self._relabel()
             self._update_names()
         self.on_change()
         return line if text else None
@@ -561,15 +678,18 @@ class Conversation:
     def peek(self, audio: np.ndarray) -> None:
         """Who is speaking in the turn in progress, before it ends — with the same rules, as if the turn were
         already a line: right after "Olá João", a voice never heard before is shown as João at once."""
-        emb = self.embedder(audio)[0]
+        emb = self.embed(audio)[0]
         with self.lock:
             cid, sim = self.voices.closest(emb)
-            if cid is None or sim < self.voices.threshold:
+            if cid is None or sim < self.voices.rules.threshold:
                 cid = max(self.voices.clusters, default=-1) + 1     # the id this new voice will get
             names = resolve_names(self.lines + [Line(0.0, 0.0, cid, 0.0)], self.voices.fixed_names())
             who = names[cid].name if cid in names else self.voices.clusters.get(cid, {}).get("label", "a new voice")
             self.speaking = (cid, who)
         self.on_change()
+
+    def _relabel(self) -> None:
+        relabel(self.lines, self.voices)
 
     def _update_names(self) -> None:
         self.names = resolve_names(self.lines, self.voices.fixed_names())
@@ -709,7 +829,8 @@ def run(args) -> None:
         sd = live._sounddevice()
         mic, mic_sr = live.input_device(sd, args.device)
 
-    emb = live.Embedder(args.ckpt or live.find_checkpoint(), "cpu" if args.cpu else None)
+    ckpt = args.ckpt or live.find_checkpoint()
+    emb = live.Embedder(ckpt, "cpu" if args.cpu else None)
     bank = live.SpeakerBank(args.bank)
     enrolled: dict[str, np.ndarray] = {}
     if bank.speakers:
@@ -718,9 +839,12 @@ def run(args) -> None:
             enrolled = dict(zip(names, C))
         else:
             print(f"(Not using {args.bank}: it was made with another model.)")
-    base = emb.default_threshold()                              # two people merged by mistake are never split
-    threshold = args.cluster_threshold or max(0.3, (0.3 if base is None else base) + 0.1)   # again: err high
-    voices = Voices(threshold, args.merge_threshold or threshold + 0.15, enrolled)
+    rules = VoiceRules.for_model(ckpt, emb.model_id)
+    if args.cluster_threshold is not None:
+        rules.threshold = args.cluster_threshold
+    if args.merge_threshold is not None:
+        rules.merge_margin = args.merge_threshold - rules.threshold
+    voices = Voices(rules, enrolled)
 
     reader = make_reader(args.llm)
     if reader is not None:
@@ -737,8 +861,13 @@ def run(args) -> None:
     names_status = f"names: {args.llm.split(':', 1)[1]}" if reader is not None else "names: off"
     print(f"Loading Whisper ({args.whisper})…")
     transcriber = Transcriber(args.whisper, args.language, "cpu" if args.cpu else None)
-    print(f"Voices: {emb.model_id} on {emb.device.type} · same speaker above {threshold:.2f}"
+    print(f"Voices: {emb.model_id} on {emb.device.type} · same speaker above {rules.threshold:.2f}"
           + (f" · enrolled: {', '.join(enrolled)}" if enrolled else ""))
+    if rules.summary:
+        print(f"  calibrated for one-microphone conversations (room compensation): {rules.summary}")
+    else:
+        print("  not calibrated for conversations yet: run 'python -m spectre.conv_eval' once (a few minutes)\n"
+              "  so that voices sharing one room and one microphone are told apart better")
 
     conv = Conversation(emb, transcriber, reader, voices)
     state = {"phase": "starting"}
@@ -833,15 +962,16 @@ def remember(conv: Conversation, bank: live.SpeakerBank, model_id: str, min_seco
         print(f"Not saving voices: {bank.path} was made with another model.")
         return
     saved, short = [], []
-    heard = set(conv.voices_heard())
     for spk, n in conv.names.items():
         c = conv.voices.clusters.get(spk)
-        if c is None or c["fixed"] or spk not in heard:
+        lines = [ln for ln in conv.lines if ln.speaker == spk and ln.raw is not None]
+        if c is None or c["fixed"] or not lines:
             continue
-        if c["seconds"] < min_seconds:
+        seconds = sum(ln.seconds for ln in lines)
+        if seconds < min_seconds:
             short.append(n.name)
             continue
-        bank.add(n.name, np.stack(c["embs"]), c["seconds"], model_id)
+        bank.add(n.name, np.stack([ln.raw for ln in lines]), seconds, model_id)   # as phase 3 expects them
         saved.append(n.name)
     if saved:
         bank.save()
@@ -865,9 +995,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ckpt", type=Path, help="SPECTRE ECAPA checkpoint (default: the latest phase-2 run)")
     p.add_argument("--bank", type=Path, default=live.DEFAULT_BANK, help="enrolled people (default: %(default)s)")
     p.add_argument("--cluster-threshold", type=float,
-                   help="voice similarity to count as the same speaker (default: the model's EER threshold + 0.1). "
-                        "Raise it if two people share a label, lower it if one person shows up as two")
-    p.add_argument("--merge-threshold", type=float, help="similarity to merge two speakers (default: threshold + 0.15)")
+                   help="voice similarity to count as the same speaker (default: the calibration of spectre.conv_eval, "
+                        "or 0.65). Raise it if two people share a label, lower it if one person shows up as two")
+    p.add_argument("--merge-threshold", type=float, help="similarity to merge two speakers (default: threshold + 0.2)")
     p.add_argument("--gap", type=float, default=0.6, help="pause that ends a turn, in seconds (default: %(default)s)")
     p.add_argument("--remember", action="store_true", help="save the voices that got a name, to recognise them next time")
     p.add_argument("--save", type=Path, help="write the final transcript to this file")
