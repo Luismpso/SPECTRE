@@ -35,7 +35,6 @@ import torch
 import torch.nn.functional as F
 import yaml
 
-from .embed_eval import eer_and_mindcf
 from .model import build_model
 
 SR = 16000
@@ -300,11 +299,37 @@ def _device(device: str | None):
     return int(device) if device is not None and device.isdigit() else device
 
 
+NO_MIC = ("No microphone found. Plug one in (a headset or webcam microphone works) and check that apps may use it "
+          "(Windows: Settings → Privacy & security → Microphone).")
+
+
+def microphones(sd) -> list[str]:
+    """Input devices as printable lines: index, name and audio API."""
+    apis = sd.query_hostapis()
+    return [f"  {i:>3}  {d['name']}  ({apis[d['hostapi']]['name']})"
+            for i, d in enumerate(sd.query_devices()) if d["max_input_channels"] > 0]
+
+
+def input_device(sd, device: str | None) -> tuple[int | str | None, int]:
+    """The microphone to use and its native sample rate — or a clear explanation when there is none."""
+    dev = _device(device)
+    try:
+        return dev, int(sd.query_devices(dev, "input")["default_samplerate"])
+    except (getattr(sd, "PortAudioError", RuntimeError), ValueError):
+        pass
+    mics = microphones(sd)
+    if not mics:
+        sys.exit(NO_MIC)
+    problem = f"'{device}' is not an available microphone." if device is not None else "There is no default microphone."
+    sys.exit(f"{problem} Choose one with --device NUMBER (or set a default microphone in the system sound "
+             f"settings):\n" + "\n".join(mics))
+
+
 def record(seconds: int, device: str | None) -> tuple[np.ndarray, int]:
     sd = _sounddevice()
-    sr = int(sd.query_devices(_device(device), "input")["default_samplerate"])
+    dev, sr = input_device(sd, device)
     print(f"Speak naturally for {seconds} s (reading a text aloud works well). Recording...")
-    audio = sd.rec(int(seconds * sr), samplerate=sr, channels=1, dtype="float32", device=_device(device))
+    audio = sd.rec(int(seconds * sr), samplerate=sr, channels=1, dtype="float32", device=dev)
     for i in range(seconds):
         time.sleep(1)
         print(f"\r  {bar((i + 1) / seconds, 30)}  {i + 1:>2}/{seconds} s", end="", flush=True)
@@ -313,14 +338,15 @@ def record(seconds: int, device: str | None) -> tuple[np.ndarray, int]:
     return audio[:, 0], sr
 
 
-def listen(identifier: LiveIdentifier, device: str | None, show) -> None:
+def listen(identifier: LiveIdentifier, device: int | str | None, show) -> None:
+    """Feed the microphone (an already resolved device, see input_device) to the identifier."""
     sd = _sounddevice()
     blocks: queue.Queue = queue.Queue()
 
     def callback(indata, frames, time_info, status):
         blocks.put(indata[:, 0].copy())
 
-    with sd.InputStream(device=_device(device), channels=1, samplerate=identifier.sr_in, dtype="float32",
+    with sd.InputStream(device=device, channels=1, samplerate=identifier.sr_in, dtype="float32",
                         blocksize=int(identifier.sr_in * 0.1), callback=callback):
         while True:
             for d in identifier.push(blocks.get()):
@@ -330,8 +356,15 @@ def listen(identifier: LiveIdentifier, device: str | None, show) -> None:
 # --------------------------------------------------------------------------- commands
 def cmd_devices(a) -> None:
     sd = _sounddevice()
-    print(sd.query_devices())
-    print("\nUse --device <number or part of the name> to choose a microphone (default: the system one).")
+    mics = microphones(sd)
+    if not mics:
+        sys.exit(NO_MIC)
+    try:
+        default = sd.query_devices(None, "input")["name"]
+    except (getattr(sd, "PortAudioError", RuntimeError), ValueError):
+        default = None
+    print("Microphones:\n" + "\n".join(mics))
+    print(f"\nDefault: {default or 'none'} — use --device NUMBER (or part of the name) to choose another.")
 
 
 def cmd_enroll(a) -> None:
@@ -339,10 +372,10 @@ def cmd_enroll(a) -> None:
     bank = SpeakerBank(a.bank)
     bank.check_model(emb.model_id)
     if a.file:
-        wav, sr = read_audio(a.file)
+        wav, _ = read_audio(a.file)
     else:
         raw, sr_in = record(a.seconds, a.device)
-        wav, sr = resample(raw, sr_in), SR
+        wav = resample(raw, sr_in)
     if len(wav) == 0 or float(np.abs(wav).max()) < 1e-6:
         sys.exit("The microphone returned pure silence. Check the input device ('devices', --device) and that "
                  "apps may use the microphone (Windows: Settings → Privacy & security → Microphone).")
@@ -450,45 +483,57 @@ def cmd_identify(a) -> None:
         print_talk_time(ident.talk_time)
         return
     sd = _sounddevice()
-    sr_in = int(sd.query_devices(_device(a.device), "input")["default_samplerate"])
+    dev, sr_in = input_device(sd, a.device)
     ident = LiveIdentifier(emb, names, C, threshold, sr_in, hop_s=a.hop, smooth=a.smooth,
                            vad_margin_db=a.vad_margin)
     print("Listening... speak! (Ctrl+C to stop)\n")
     try:
-        listen(ident, a.device, lambda d: show_live(d, threshold))
+        listen(ident, dev, lambda d: show_live(d, threshold))
     except KeyboardInterrupt:
         print("\n")
         print_talk_time(ident.talk_time)
 
 
-def main(argv: list[str] | None = None) -> None:
-    p = argparse.ArgumentParser(prog="python -m spectre.live", description="SPECTRE live speaker recognition")
-    p.add_argument("--bank", type=Path, default=DEFAULT_BANK, help="enrolled people (default: %(default)s)")
-    p.add_argument("--ckpt", type=Path, help="ECAPA checkpoint (default: the latest phase-2 run)")
-    p.add_argument("--device", help="microphone: number or part of the name (see 'devices')")
-    p.add_argument("--cpu", action="store_true", help="run the model on the CPU")
-    p.add_argument("--vad-margin", type=float, default=10.0, help="dB above the noise floor that counts as speech")
+def _common(parser: argparse.ArgumentParser, suppress: bool) -> argparse.ArgumentParser:
+    """Options valid before or after the command ('--device 2 enroll Ana' or 'enroll Ana --device 2')."""
+    d = (lambda v: argparse.SUPPRESS) if suppress else (lambda v: v)
+    parser.add_argument("--bank", type=Path, default=d(DEFAULT_BANK), help="enrolled people (default: %s)" % DEFAULT_BANK)
+    parser.add_argument("--ckpt", type=Path, default=d(None), help="ECAPA checkpoint (default: the latest phase-2 run)")
+    parser.add_argument("--device", default=d(None), help="microphone: number or part of the name (see 'devices')")
+    parser.add_argument("--cpu", action="store_true", default=d(False), help="run the model on the CPU")
+    parser.add_argument("--vad-margin", type=float, default=d(10.0), help="dB above the noise floor that counts as speech")
+    return parser
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = _common(argparse.ArgumentParser(prog="python -m spectre.live",
+                                        description="SPECTRE live speaker recognition"), suppress=False)
     sub = p.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("devices", help="list microphones").set_defaults(func=cmd_devices)
-    e = sub.add_parser("enroll", help="register a person from the microphone or from audio files")
+    add = lambda name, **kw: _common(sub.add_parser(name, **kw), suppress=True)
+    add("devices", help="list microphones").set_defaults(func=cmd_devices)
+    e = add("enroll", help="register a person from the microphone or from audio files")
     e.add_argument("name")
     e.add_argument("--file", type=Path, nargs="+", help="audio file(s) instead of the microphone")
     e.add_argument("--seconds", type=int, default=20, help="recording length (default: %(default)s)")
     e.add_argument("--min-speech", type=float, default=8.0, help="minimum seconds of speech (default: %(default)s)")
     e.add_argument("--replace", action="store_true", help="replace this person's previous enrollment")
     e.set_defaults(func=cmd_enroll)
-    sub.add_parser("list", help="show enrolled people").set_defaults(func=cmd_list)
-    r = sub.add_parser("remove", help="delete a person")
+    add("list", help="show enrolled people").set_defaults(func=cmd_list)
+    r = add("remove", help="delete a person")
     r.add_argument("name")
     r.set_defaults(func=cmd_remove)
-    sub.add_parser("calibrate", help="suggest a threshold from the enrolled people").set_defaults(func=cmd_calibrate)
-    i = sub.add_parser("identify", help="recognise who is speaking (live, or over a file)")
+    add("calibrate", help="suggest a threshold from the enrolled people").set_defaults(func=cmd_calibrate)
+    i = add("identify", help="recognise who is speaking (live, or over a file)")
     i.add_argument("--file", type=Path, nargs="+", help="audio file(s) instead of the microphone")
     i.add_argument("--threshold", type=float, help="minimum score to name someone (default: calibrated value)")
     i.add_argument("--hop", type=float, default=0.5, help="seconds between decisions (default: %(default)s)")
     i.add_argument("--smooth", type=float, default=0.5, help="weight of the newest score, 0-1 (default: %(default)s)")
     i.set_defaults(func=cmd_identify)
-    a = p.parse_args(argv)
+    return p
+
+
+def main(argv: list[str] | None = None) -> None:
+    a = build_parser().parse_args(argv)
     a.func(a)
 
 

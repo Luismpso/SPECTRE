@@ -136,11 +136,27 @@ def test_embedder_batching_matches_one_by_one(tiny_ckpt):
 class FakeSoundDevice:
     """Stands in for the sounddevice package: plays a waveform through the input callback."""
 
-    def __init__(self, wav, sr):
-        self.wav, self.sr = wav, sr
+    class PortAudioError(Exception):
+        pass
+
+    def __init__(self, wav=None, sr=SR, mics=("USB Microphone",), has_default=True):
+        self.wav, self.sr, self.has_default = wav, sr, has_default
+        self.devices = [{"name": "Speakers", "max_input_channels": 0, "hostapi": 0}] + \
+                       [{"name": m, "max_input_channels": 1, "hostapi": 0} for m in mics]
+
+    def query_hostapis(self):
+        return ({"name": "MME"},)
 
     def query_devices(self, device=None, kind=None):
-        return {"default_samplerate": float(self.sr)}
+        if device is None and kind is None:
+            return self.devices
+        if device is None:
+            if not self.has_default:
+                raise self.PortAudioError("Error querying device -1")   # what Windows does without a default mic
+            return {"name": self.devices[1]["name"], "default_samplerate": float(self.sr)}
+        if not (isinstance(device, int) and device < len(self.devices) and self.devices[device]["max_input_channels"]):
+            raise ValueError(f"No input device matching {device!r}")
+        return {"name": self.devices[device]["name"], "default_samplerate": float(self.sr)}
 
     def rec(self, frames, samplerate, channels, dtype, device=None):
         return self.wav[:frames, None].copy()
@@ -183,3 +199,41 @@ def test_listen_and_record_with_fake_microphone(monkeypatch):
     with pytest.raises(KeyboardInterrupt):
         live.listen(ident, None, show)
     assert seen[-1].name == "B"
+
+
+def test_no_default_microphone_explains_how_to_choose(monkeypatch):
+    fake = FakeSoundDevice(tone(300, 3), mics=("Headset Microphone", "Webcam"), has_default=False)
+    monkeypatch.setattr(live, "_sounddevice", lambda: fake)
+    with pytest.raises(SystemExit) as err:
+        live.record(2, None)
+    msg = str(err.value)
+    assert "no default microphone" in msg and "--device" in msg and "Headset Microphone" in msg
+    assert live.input_device(fake, "2") == (2, SR)                    # choosing one by number works
+    with pytest.raises(SystemExit) as err:
+        live.input_device(fake, "0")                                  # speakers are not a microphone
+    assert "not an available microphone" in str(err.value)
+
+
+def test_no_microphone_at_all(monkeypatch, capsys):
+    fake = FakeSoundDevice(mics=(), has_default=False)
+    monkeypatch.setattr(live, "_sounddevice", lambda: fake)
+    with pytest.raises(SystemExit) as err:
+        live.record(2, None)
+    assert "No microphone found" in str(err.value)
+    with pytest.raises(SystemExit):
+        live.main(["devices"])
+
+
+def test_devices_lists_only_microphones(monkeypatch, capsys):
+    monkeypatch.setattr(live, "_sounddevice", lambda: FakeSoundDevice(mics=("USB Microphone",)))
+    live.main(["devices"])
+    out = capsys.readouterr().out
+    assert "USB Microphone" in out and "Speakers" not in out and "Default: USB Microphone" in out
+
+
+def test_options_before_or_after_the_command():
+    p = live.build_parser()
+    a = p.parse_args(["enroll", "Luís", "--device", "3", "--cpu"])
+    assert (a.name, a.device, a.cpu, a.bank) == ("Luís", "3", True, live.DEFAULT_BANK)
+    a = p.parse_args(["--device", "Webcam", "identify", "--threshold", "0.3"])
+    assert (a.device, a.threshold, a.cpu) == ("Webcam", 0.3, False)

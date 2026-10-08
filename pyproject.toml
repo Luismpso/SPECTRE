@@ -10,6 +10,7 @@ requires-python = ">=3.10"
 
 [project.optional-dependencies]
 demo = ["sounddevice>=0.4.6"]   # microphone access for the live demo
+conversation = ["sounddevice>=0.4.6", "transformers>=4.56", "rich>=13"]   # phase 4: + Whisper, live panel
 
 [tool.setuptools.packages.find]
 where = ["src"]
