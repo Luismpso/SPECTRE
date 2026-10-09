@@ -307,6 +307,33 @@ def test_a_name_closing_a_reply_points_back():
     assert names[1].evidence[-1] == 'line 3: called "Pedro" in the reply to line 2'
 
 
+def test_rules_read_names_without_an_llm():
+    read = lambda line: cv.parse_names(cv.RuleReader().ask([], line), line)
+    assert read("Ó João, há quanto tempo não te via?") == [("João", "addressed")]
+    assert read("Olá, Joana. Tudo bem contigo?") == [("Joana", "addressed")]
+    assert read("Tudo ótimo. Olha, apresente que o Pedro trabalha comigo.") == [("Pedro", "introduced")]
+    assert read("Apresento-te a Inês e o Rui.") == [("Inês", "introduced"), ("Rui", "introduced")]
+    assert read("Muito prazer, João. Eu sou o Pedro.") == [("João", "addressed"), ("Pedro", "self")]
+    assert read("O prazer é meu, Tedo. A Rita também vem?") == [("Tedo", "replied"), ("Rita", "mentioned")]
+    assert read("Chamo-me Ana.") == [("Ana", "self")]
+    assert read("Eu sou Pedro.") == [("Pedro", "self")]                # no article: fine for common first names…
+    assert read("Oh João, há quanto tempo não te via?") == [("João", "addressed")]   # Whisper's spelling of "Ó"
+    assert read("Oh, a Rita também vem?") == [("Rita", "mentioned")]
+    for line in ("Então, vamos andando.", "Eu sou do Porto.", "Obrigado, Senhor.", "A camisola rosa é tua.",
+                 "Fui a Lisboa ontem.", "Sou Benfica desde pequeno."):        # …not for any capitalised word
+        assert read(line) == [], line
+
+
+def test_rules_name_the_whisper_transcript():
+    """The lines Whisper wrote on the user's PC, with the voices found there: rules alone find the same names."""
+    said = [(0, "Ó João, há quanto tempo não te via?"), (1, "Olá, Joana. Tudo bem contigo? Que bom ver te."),
+            (0, "Tudo ótimo. Olha, apresente que o Pedro trabalha comigo."), (2, "Muito prazer, João."),
+            (2, "Eu sou o Pedro."), (1, "O prazer é meu, Tedo. A Rita também vem juntar conosco?"),
+            (0, "A Rita Chega mais tarde ficou presa no trabalho."), (2, "Então, vamos andando, que estou cheio de fome.")]
+    lines = [line(spk, cv.parse_names(cv.RuleReader().ask([], text), text), text) for spk, text in said]
+    assert {s: n.name for s, n in cv.resolve_names(lines, {}).items()} == {0: "Joana", 1: "João", 2: "Pedro"}
+
+
 # --------------------------------------------------------------------------- deciding who is who
 def test_the_two_line_example():
     lines = [line(0, [("João", "addressed")]), line(1, None, None)]   # "Olá João" · someone else starts answering
@@ -363,6 +390,12 @@ def test_noise_is_dropped_and_forgotten():
     conv = make_conversation(FakeReader())
     assert conv.hear(cv.Turn(0, 1, tone(600, 1.0), 1.0)) is None       # a door closing: no words
     assert conv.lines == [] and conv.voices.clusters == {} and conv.voices.next_label == 1
+
+
+def test_conversation_with_the_rule_reader():
+    conv = make_conversation(cv.RuleReader())
+    process(conv, turns_of(dialogue(), SR))
+    assert labels(conv) == WHO
 
 
 def test_enrolled_people_and_no_llm():

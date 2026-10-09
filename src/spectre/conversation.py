@@ -347,16 +347,18 @@ ANSWERING = r"(?:muito obrigad[oa]|obrigad[oa]|o prazer e meu|de nada|igualmente
 
 def vocative(name: str, line: str) -> str | None:
     """How a name calls someone, from the words around it: "answer" right after thanks or a reply ("Obrigado,
-    Maria", "O prazer é meu, Pedro") — that person spoke before; "call" after a greeting or set off by a comma
-    ("Olá, João", "Pedro, anda cá", "Anda cá, Pedro!"); None when the name is not a vocative."""
+    Maria", "O prazer é meu, Pedro") — that person spoke before; "call" after a greeting, after the particle "ó"
+    (Whisper also writes "oh"), or set off by a comma ("Olá, João", "Ó João", "Oh João", "Pedro, anda cá", "Anda cá,
+    Pedro!"); None otherwise."""
     first = next((p for p in re.findall(r"[^\W\d_]+", fold(name)) if len(p) > 1), "")
     if not first:
         return None
     t, n = fold(line), re.escape(first)
+    marked = fold(re.sub(r"(?<![^\W\d_])(?:[óÓôÔ]|[Oo]h)(?=[\s,])", "\x01", line))   # the particle, before folding
     if re.search(rf"\b{ANSWERING}\s*[,!]?\s*{n}\b", t):
         return "answer"
-    if (re.search(rf"\b{CALLING}\s*[,!]?\s*{n}\b", t) or re.search(rf",\s*{n}\b\s*(?:[.!?…]|$)", t)
-            or re.search(rf"(?:^|[.!?]\s+){n}\s*,", t)):
+    if (re.search(rf"\b{CALLING}\s*[,!]?\s*{n}\b", t) or re.search(rf"\x01[\s,]+{n}\b", marked)
+            or re.search(rf",\s*{n}\b\s*(?:[.!?…]|$)", t) or re.search(rf"(?:^|[.!?]\s+){n}\s*,", t)):
         return "call"
     return None
 
@@ -470,16 +472,96 @@ class HFReader:
         return self.tok.decode(out[0][ids["input_ids"].shape[1]:], skip_special_tokens=True)
 
 
+# =========================================================================== reading names without an LLM
+FIRST_NAMES = frozenset(fold(n) for n in """
+Abel Abílio Adão Adelino Adriano Afonso Agostinho Albano Alberto Albino Alexandre Alfredo Álvaro Américo Amílcar André
+Ângelo Aníbal António Antônio Armando Arnaldo Artur Arthur Augusto Aurélio Baltasar Benjamim Bento Bernardo Bruno
+Caetano Caio Camilo Carlos Cauã Celso César Cristiano Cristóvão Custódio Daniel Dário David Davi Diego Diogo Dinis
+Domingos Duarte Edgar Edson Eduardo Elias Emanuel Emílio Enzo Ernesto Estêvão Eugénio Fabiano Fábio Fausto Felipe
+Félix Fernando Filipe Flávio Francisco Frederico Gabriel Gaspar Gil Gilberto Gonçalo Guilherme Gustavo Heitor Hélder
+Hélio Henrique Horácio Hugo Humberto Igor Inácio Isaac Ivo Jaime João Joaquim Jonas Jorge José Josué Juliano Júlio
+Kevin Leandro Leonardo Leonel Lorenzo Lourenço Lucas Luciano Lúcio Luís Luiz Manuel Marcelo Marcos Marco Mário Martim
+Mateus Matheus Matias Maurício Miguel Moisés Murilo Natan Nélson Nicolau Noah Norberto Nuno Octávio Otávio Orlando
+Óscar Osvaldo Patrício Paulo Pedro Pietro Rafael Raimundo Ramiro Raul Reinaldo Renan Renato Ricardo Roberto Rodrigo
+Rogério Romeu Ronaldo Rúben Rui Salvador Samuel Sandro Santiago Sebastião Sérgio Silvano Silvestre Simão Tadeu Telmo
+Teodoro Thiago Tiago Tomás Valentim Valter Vasco Vicente Victor Vítor Vinícius Wagner Wesley William Xavier Yuri Zé
+Adelaide Adriana Alexandra Alice Amanda Amélia Ana Andreia Ângela Anabela Antónia Aurora Bárbara Beatriz Benedita
+Bianca Bruna Camila Carla Carlota Carmen Carolina Catarina Cecília Célia Clara Cláudia Constança Cristiana Cristina
+Daniela Débora Diana Elisa Elisabete Ema Emília Eva Fabiana Fátima Fernanda Filipa Flávia Francisca Gabriela Giovanna
+Glória Graça Helena Heloísa Inês Irene Isabel Isabela Isadora Ivone Jéssica Joana Joaquina Júlia Juliana Laís Lara
+Larissa Laura Leonor Letícia Lídia Lívia Lorena Lúcia Luana Luísa Luiza Madalena Mafalda Manuela Mara Márcia Margarida
+Maria Mariana Marina Marisa Marta Matilde Melissa Mónica Natália Natacha Nádia Olívia Paula Patrícia Pietra Priscila
+Raquel Rebeca Regina Renata Rita Rosa Rosana Rosário Sabrina Salomé Sandra Sara Sílvia Simone Sofia Sónia Sophia
+Susana Tânia Tatiana Teresa Thaís Valentina Valéria Vanessa Vera Verónica Vitória Viviane Yara Yasmin Zélia
+""".split())
+NOT_NAMES = frozenset(fold(w) for w in """senhor senhora sr sra dona dom doutor doutora dr dra professor professora
+engenheiro engenheira deus mãe pai mano mana filho filha amigo amiga querido querida pessoal malta gente chefe menino
+menina rapaz rapariga tio tia avó avô primo prima""".split())
+SELF_INTRO = (r"\b(?:eu\s+)?sou\s+(?:o|a)\s+{n}\b", r"\bchamo-me\s+{n}\b", r"\bme\s+chamo\s+{n}\b",
+              r"\bmeu\s+nome\s+e\s+{n}\b", r"\baqui\s+(?:e|fala)\s+(?:o|a)\s+{n}\b")
+SELF_INTRO_BARE = r"\b(?:eu\s+)?sou\s+{n}\b"      # "Eu sou Pedro": without the article, only for common first names
+INTRODUCING = (r"\bapresent[\w-]*\s+(?:[\w,]+\s+){{0,4}}?(?:o|a)\s+{n}\b", r"\b(?:este|esta)\s+e\s+(?:o|a)\s+{n}\b",
+               r"\bconhec[\w-]*\s+(?:o|a)\s+{n}\b")
+
+
+def name_role(name: str, line: str) -> str:
+    """How a name is used, from the words around it: its own name, introduced, called (a vocative) or mentioned."""
+    t, n = fold(line), re.escape(fold(name))
+    if any(re.search(p.format(n=n), t) for p in SELF_INTRO) or (
+            fold(name) in FIRST_NAMES and re.search(SELF_INTRO_BARE.format(n=n), t)):
+        return "self"
+    if any(re.search(p.format(n=n), t) for p in INTRODUCING):
+        return "introduced"
+    return "addressed" if vocative(name, line) else "mentioned"
+
+
+def rule_names(line: str) -> list[tuple[str, str]]:
+    """Names in a line without a language model: capitalised common first names, and any other capitalised word
+    used as a name (called, introduced, said as one's own); a sentence never starts with an unknown name."""
+    out, start = [], True
+    for m in re.finditer(r"[^\W\d_]+|[.!?…]", line):
+        word = m.group(0)
+        if word in ".!?…":
+            start = True
+            continue
+        first_word, start = start, False
+        key = fold(word)
+        if not word[0].isupper() or len(key) < 2 or key in NOT_NAMES:
+            continue
+        known = key in FIRST_NAMES
+        if first_word and not known:
+            continue
+        role = name_role(word, line)
+        if known or role != "mentioned":
+            out.append((word, role))
+    return out
+
+
+class RuleReader:
+    """Reads names with rules instead of a language model (instant, nothing to install; used on the phone)."""
+
+    def check(self) -> str | None:
+        return None
+
+    def warm(self) -> None:
+        pass
+
+    def ask(self, context: list[str], line: str) -> str:
+        return json.dumps({"names": [{"name": n, "role": r} for n, r in rule_names(line)]}, ensure_ascii=False)
+
+
 def make_reader(spec: str):
-    """'ollama:gemma3:12b' · 'hf:Qwen/Qwen2.5-3B-Instruct' · 'none'."""
+    """'ollama:gemma3:12b' · 'hf:Qwen/Qwen2.5-3B-Instruct' · 'rules' · 'none'."""
     if spec in ("none", ""):
         return None
+    if spec == "rules":
+        return RuleReader()
     kind, _, model = spec.partition(":")
     if kind == "ollama" and model:
         return OllamaReader(model)
     if kind == "hf" and model:
         return HFReader(model)
-    sys.exit(f"Unknown --llm '{spec}'. Use ollama:<model>, hf:<model> or none.")
+    sys.exit(f"Unknown --llm '{spec}'. Use ollama:<model>, hf:<model>, rules or none.")
 
 
 # =========================================================================== deciding who is who
@@ -858,7 +940,8 @@ def run(args) -> None:
         if problem:
             print(f"⚠ {problem}\n  Continuing without names (captions and voices only).")
             reader = None
-    names_status = f"names: {args.llm.split(':', 1)[1]}" if reader is not None else "names: off"
+    names_status = ("names: off" if reader is None else "names: rules" if args.llm == "rules"
+                    else f"names: {args.llm.split(':', 1)[1]}")
     print(f"Loading Whisper ({args.whisper})…")
     transcriber = Transcriber(args.whisper, args.language, "cpu" if args.cpu else None)
     print(f"Voices: {emb.model_id} on {emb.device.type} · same speaker above {rules.threshold:.2f}"
@@ -989,7 +1072,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--realtime", action="store_true", help="with --file: go at real speed, as if it were live")
     p.add_argument("--device", help="microphone: number or part of the name (see 'python -m spectre.live devices')")
     p.add_argument("--llm", default="ollama:gemma3:12b",
-                   help="who reads the lines: ollama:<model>, hf:<model> or none (default: %(default)s)")
+                   help="who reads the lines: ollama:<model>, hf:<model>, rules (no LLM) or none (default: %(default)s)")
     p.add_argument("--whisper", default="openai/whisper-large-v3-turbo", help="Whisper model (default: %(default)s)")
     p.add_argument("--language", default="pt", help="spoken language, or 'auto' (default: %(default)s)")
     p.add_argument("--ckpt", type=Path, help="SPECTRE ECAPA checkpoint (default: the latest phase-2 run)")

@@ -117,7 +117,7 @@ Each turn ends at a pause, and is also cut where the voice changes (quick replie
 The LLM only reads and the code decides, so a small local model is enough, each call is one short line and every name can be explained. While someone is still talking, the panel already shows who it is (*▶ João is speaking…*), with the same rules.
 
 - Everything runs locally and audio is never written to disk. `--save` writes the transcript; `--remember` adds the voices that got a name (≥ 8 s of speech) to `enrollments/speakers.json`, so next time they are recognised by voice.
-- `--llm none` gives captions and voices without names; `--llm hf:<model>` uses a Hugging Face chat model instead of Ollama; `ollama:gemma3:4b` is a lighter option. On a 16 GB GPU, Whisper turbo and `gemma3:12b` fit side by side.
+- `--llm none` gives captions and voices without names; `--llm rules` reads the names with rules instead of an LLM (common first names and the words around them: instant, nothing to install, what the Android app uses); `--llm hf:<model>` uses a Hugging Face chat model instead of Ollama; `ollama:gemma3:4b` is a lighter option. On a 16 GB GPU, Whisper turbo and `gemma3:12b` fit side by side.
 - Tuning: `--cluster-threshold` (default: the calibration, or 0.65 without one) — raise it if two people share a label, lower it if one person shows up as two; `--gap` (0.6 s) — the pause that ends a turn.
 - Limits: overlapping speech is not separated, very short turns ("Sim.") are harder to attribute, and someone is only named once their name is said. Similar voices can still be merged, mostly when people answer each other very quickly; enrolling them (phase 3) avoids that.
 
@@ -138,6 +138,31 @@ Every LibriSpeech speaker reads in their own room with their own microphone, so 
 
 The remaining errors come from the model itself, which still carries the room; training it with reverberation and microphone augmentation is the natural next step.
 
+## Phase 5 — on the phone (Android)
+
+`android/` is the same live captions as an Android app in Kotlin, with everything on the phone: no PC, no server, and the audio never leaves it. The screen is a terminal like the PC panel. It only reads the captions, so another display (Meta's glasses) can show them later.
+
+```bash
+pip install onnx onnxruntime
+python -m spectre.export_android      # your model → android/app/src/main/assets/ (spectre_ecapa.onnx + voices.json)
+cd android
+./gradlew assembleRelease             # → app/build/outputs/apk/release/app-arm64-v8a-release.apk (or open android/ in Android Studio)
+```
+
+The first build downloads and compiles whisper.cpp (a few minutes). The APK (about 27 MB) is signed with the debug key, so it installs directly: copy it to the phone and open it (allow installing from unknown sources), or `adb install`.
+
+| | PC | Phone |
+|---|---|---|
+| Voices | SPECTRE in PyTorch | the same model on ONNX Runtime (the STFT written as a convolution, the weights stored as float16: 13 MB, embeddings within 0.001 of PyTorch), with the PC's calibration and room compensation (`voices.json`) |
+| Words | Whisper large-v3-turbo (transformers) | Whisper on whisper.cpp, quantised: *small* by default (190 MB), *base* (60 MB, fastest) or *turbo* (574 MB, best and slowest), downloaded once on first use |
+| Names | local LLM, or `--llm rules` | the same rules as `--llm rules` |
+
+- `android/core` is plain Kotlin: turns, voices, names and the conversation, ported line by line from `spectre.conversation` and checked against the Python with shared fixtures (`python scripts/make_android_golden.py`, then `./gradlew :core:test`). It has no Android code, so it can move to Kotlin Multiplatform for an iPhone version.
+- `android/app` is the Android part: the microphone (16 kHz, no automatic gain), ONNX Runtime, whisper.cpp through JNI, the model download and the screen.
+- Whisper encodes only the turn (with at least 10 s of context) instead of a 30-s window: about 3× faster, about as accurate on the test conversation. On a 2-core x86 test machine *small* runs at 1.3× real time and *base* at 0.4×. A phone with four fast cores should do better, but this hasn't been measured on a phone yet: if the captions fall behind (the status line counts the turns waiting), choose *base*.
+- Needs Android 10+ and a 64-bit ARM processor with ARMv8.2 dot-product instructions (from about 2018; aimed at flagships from 2022 on). The screen stays on while listening. *Share* sends the transcript with how the names were found.
+- Next, Meta's glasses: with the Wearables Device Access Toolkit the app stays on the phone and the glasses are a display (600 × 600; each update replaces the whole screen). The audio should still come from the phone, because the glasses' Bluetooth microphone is 8 kHz and beamformed towards the wearer, which suppresses exactly the other voices. Listening also moves to a foreground service, so it goes on with the screen off.
+
 ## Structure
 
 ```
@@ -156,7 +181,10 @@ src/spectre/
   conversation.py  live captions: turns, voice clustering, Whisper, names from context (local LLM)
   room.py       simulated rooms and one-microphone conversations
   conv_eval.py  room compensation and voice calibration for conversations
+  export_android.py  the model and voice rules for the Android app (ONNX + voices.json)
 tests/        fast tests for phases 3–4 (no data, GPU, microphone or Ollama needed): pytest -q
+scripts/make_android_golden.py  fixtures that check the Kotlin port against the Python
+android/      Android app (phase 5): core/ = conversation logic in plain Kotlin, app/ = microphone, models, screen
 ```
 
 ## Results

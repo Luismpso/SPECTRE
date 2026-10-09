@@ -24,6 +24,17 @@ dist/
 .pytest_cache/
 .ipynb_checkpoints/
 
+# --- Android app (android/) ---
+android/.gradle/
+android/.kotlin/
+android/app/.cxx/
+android/local.properties
+*.apk
+*.aab
+# made from your trained model by `python -m spectre.export_android`
+android/app/src/main/assets/spectre_ecapa.onnx
+android/app/src/main/assets/voices.json
+
 # --- Environments ---
 .venv/
 venv/
