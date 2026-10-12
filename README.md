@@ -2,7 +2,7 @@
 
 **SPE**ctral **C**lassifier for **T**alker **RE**cognition — identifying who is speaking from the frequency spectrum of their voice.
 
-> Status: **Phase 4 — conversation captions with names** · phases 1–3 complete
+> Status: **Phase 5 — live captions on an Android phone** · phases 1–4 complete
 
 ## Idea
 
@@ -14,6 +14,7 @@ The approach borrows from the BirdCLEF Kaggle competitions: audio is turned into
 | **2 · Embeddings** ✅ | Open-set identification: enroll a new person with a few seconds of speech, no retraining | ECAPA-TDNN + AAM-softmax, cosine scoring, EER |
 | **3 · Demo** ✅ | Live microphone identification with an "unknown speaker" threshold | Enrollment + real-time inference |
 | **4 · Conversation** ✅ | Live captions that work out who is who from what is said ("Olá João" → the next voice is João) | Voice clustering + Whisper + local LLM + turn-taking rules |
+| **5 · Phone** ✅ | The same live captions on an Android phone, with everything on the device (no PC, no server) | Kotlin app: SPECTRE on ONNX Runtime + Whisper on whisper.cpp + rule-based names |
 
 ## Design choices
 
@@ -182,7 +183,7 @@ src/spectre/
   room.py       simulated rooms and one-microphone conversations
   conv_eval.py  room compensation and voice calibration for conversations
   export_android.py  the model and voice rules for the Android app (ONNX + voices.json)
-tests/        fast tests for phases 3–4 (no data, GPU, microphone or Ollama needed): pytest -q
+tests/        fast tests for phases 3–5 (no data, GPU, microphone or Ollama needed): pytest -q
 scripts/make_android_golden.py  fixtures that check the Kotlin port against the Python
 android/      Android app (phase 5): core/ = conversation logic in plain Kotlin, app/ = microphone, models, screen
 ```
